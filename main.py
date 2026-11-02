@@ -36,22 +36,10 @@ HOLIDAY_URL = "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{
 HOLIDAY_MIRROR = "https://fastly.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json"
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
-# 固定作息表：第 1 节到第 12 节。
-PERIODS = (
-    ("08:05", "08:50"),
-    ("08:50", "09:35"),
-    ("09:45", "10:30"),
-    ("10:40", "11:25"),
-    ("11:25", "12:10"),
-    ("13:20", "14:05"),
-    ("14:10", "14:55"),
-    ("15:05", "15:50"),
-    ("15:55", "16:40"),
-    ("18:00", "18:45"),
-    ("18:50", "19:35"),
-    ("19:40", "20:25"),
-)
-PERIOD_LABELS = ["自动识别"] + ["第%d节" % i for i in range(1, 13)]
+# 作息表由用户通过“设置每日作息”自行配置，程序不再写死节次。
+# PERIODS / PERIOD_LABELS 在载入 schedule.json 后动态生成。
+PERIODS = ()
+PERIOD_LABELS = ["自动识别"]
 BUBBLE_MAX_WIDTH = 350
 REMINDER_DISPLAY_MS = 60000       # 每次弹出停留 60 秒
 REMINDER_SNOOZE_MS = 180000       # 自动隐藏后 180 秒重弹
@@ -73,6 +61,7 @@ COURSES_PATH = os.path.join(BASE_DIR, "courses.json")
 HOLIDAYS_PATH = os.path.join(BASE_DIR, "holidays.json")
 MAKEUP_PATH = os.path.join(BASE_DIR, "makeup.json")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+SCHEDULE_PATH = os.path.join(BASE_DIR, "schedule.json")
 
 
 def pet_path():
@@ -108,6 +97,48 @@ def save_json(path, data):
     os.replace(tmp, path)
 
 
+def normalize_schedule(raw):
+    """把 schedule.json 内容规范成 [{"start": "HH:MM", "end": "HH:MM"}]。"""
+    if isinstance(raw, dict):
+        raw = raw.get("periods", [])
+    if not isinstance(raw, list):
+        return []
+    rows = []
+    for item in raw:
+        if isinstance(item, dict):
+            start, end = item.get("start"), item.get("end")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            start, end = item[0], item[1]
+        else:
+            continue
+        start = parse_time(str(start)) if start is not None else None
+        end = parse_time(str(end)) if end is not None else None
+        if not start or not end:
+            continue
+        if time_to_minutes(start) >= time_to_minutes(end):
+            continue
+        rows.append({"start": start, "end": end})
+    rows.sort(key=lambda row: (time_to_minutes(row["start"]),
+                               time_to_minutes(row["end"])))
+    return rows
+
+
+def set_periods(periods):
+    """更新全局作息表，供课表、自动识别和下拉框共同使用。"""
+    global PERIODS, PERIOD_LABELS
+    normalized = normalize_schedule(periods)
+    PERIODS = tuple((row["start"], row["end"]) for row in normalized)
+    PERIOD_LABELS = ["自动识别"] + [
+        "第%d节" % index for index in range(1, len(PERIODS) + 1)
+    ]
+    return normalized
+
+
+def load_schedule():
+    """读取本地 schedule.json；不存在或为空时返回空作息表。"""
+    return set_periods(load_json(SCHEDULE_PATH, []))
+
+
 def parse_time(text):
     if not isinstance(text, str):
         return None
@@ -133,10 +164,15 @@ def time_to_minutes(text):
     return hour * 60 + minute
 
 
+def minutes_to_time(total):
+    total = int(total) % (24 * 60)
+    return "%02d:%02d" % (total // 60, total % 60)
+
+
 def detect_period_start(text):
     """找与输入时间最接近的一节课的开始节次。"""
     minutes = time_to_minutes(text)
-    if minutes is None:
+    if minutes is None or not PERIODS:
         return None
     return min(
         range(1, len(PERIODS) + 1),
@@ -147,7 +183,7 @@ def detect_period_start(text):
 def detect_period_end(text):
     """找与输入时间最接近的一节课的结束节次。"""
     minutes = time_to_minutes(text)
-    if minutes is None:
+    if minutes is None or not PERIODS:
         return None
     return min(
         range(1, len(PERIODS) + 1),
@@ -156,7 +192,7 @@ def detect_period_end(text):
 
 
 def valid_period(value):
-    """接受 4 / "4" / "第4节"，返回 1-12 的节次，否则 None。"""
+    """接受 4 / "4" / "第4节"，返回有效节次，否则 None。"""
     if value is None:
         return None
     if isinstance(value, int):
@@ -173,7 +209,9 @@ def valid_period(value):
 
 
 def resolve_course_periods(course):
-    """手动指定节次优先；返回 (起始节, 结束节)，都在 1-12。"""
+    """手动指定节次优先；返回 (起始节, 结束节)，没有作息表时返回 (None, None)。"""
+    if not PERIODS:
+        return None, None
     auto_from = detect_period_start(course.get("start", "")) or 1
     auto_to = detect_period_end(course.get("end", "")) or auto_from
     period_from = valid_period(course.get("period_from")) or auto_from
@@ -848,8 +886,198 @@ class ReminderWindow:
             self.on_close(self)
 
 
+class ScheduleDialog(tk.Toplevel):
+    """自由添加、删除节次并设置起止时间的作息表编辑器。"""
+
+    def __init__(self, parent, periods):
+        super().__init__(parent)
+        self.result = None
+        self.rows = []
+        self.title("设置每日作息")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.geometry("720x580")
+        self.minsize(620, 420)
+
+        outer = ttk.Frame(self, padding=(14, 12, 14, 10))
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="设置每日作息",
+                  style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="自由添加或删除节次，并填写每节课的开始、结束时间（HH:MM）。"
+                 "保存后课表会按这里的节次数量自动重绘。",
+            style="Hint.TLabel", wraplength=660,
+        ).pack(anchor="w", pady=(4, 10))
+
+        table_head = ttk.Frame(outer)
+        table_head.pack(fill="x", pady=(0, 4))
+        ttk.Label(table_head, text="节次", width=9).pack(side="left")
+        ttk.Label(table_head, text="开始时间", width=13).pack(side="left", padx=(8, 0))
+        ttk.Label(table_head, text="结束时间", width=13).pack(side="left", padx=(24, 0))
+        ttk.Label(table_head, text="操作", width=10).pack(side="left", padx=(28, 0))
+
+        body = ttk.Frame(outer)
+        body.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(body, bg="#ffffff", highlightthickness=1,
+                                highlightbackground="#dbe2ea", bd=0)
+        scrollbar = ttk.Scrollbar(body, orient="vertical",
+                                  command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.inner = ttk.Frame(self.canvas, padding=(4, 4))
+        self.window_id = self.canvas.create_window(
+            (0, 0), window=self.inner, anchor="nw")
+        self.inner.bind(
+            "<Configure>",
+            lambda _event: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind(
+            "<Configure>",
+            lambda event: self.canvas.itemconfigure(self.window_id, width=event.width))
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.bind("<MouseWheel>", self._on_mousewheel)
+        self.bind("<Escape>", lambda _event: self._cancel())
+
+        bottom = ttk.Frame(outer)
+        bottom.pack(fill="x", pady=(10, 0))
+        ttk.Button(bottom, text="添加节次", command=self._add_row).pack(side="left")
+        ttk.Button(bottom, text="取消", command=self._cancel).pack(
+            side="right", padx=(8, 0))
+        ttk.Button(bottom, text="保存作息", command=self._save).pack(side="right")
+        self.count_label = ttk.Label(bottom, text="", style="Hint.TLabel")
+        self.count_label.pack(side="left", padx=(12, 0))
+
+        for item in periods or []:
+            self._add_row(item.get("start"), item.get("end"), scroll=False)
+        if not self.rows:
+            self._add_row()
+        self._renumber()
+
+        self.update_idletasks()
+        width = self.winfo_reqwidth()
+        height = self.winfo_reqheight()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        x = min(max(0, parent.winfo_rootx() + (parent.winfo_width() - width) // 2),
+                max(0, screen_w - width - 20))
+        y = min(max(0, parent.winfo_rooty() + (parent.winfo_height() - height) // 3),
+                max(0, screen_h - height - 60))
+        self.geometry("+%d+%d" % (x, y))
+        self.after(50, self._activate)
+
+    def _activate(self):
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+        if self.rows:
+            self.rows[0]["start_entry"].focus_set()
+
+    def _on_mousewheel(self, event):
+        delta = int(-1 * (event.delta / 120)) if event.delta else 0
+        if delta:
+            self.canvas.yview_scroll(delta, "units")
+
+    def _default_times(self):
+        if self.rows:
+            previous_end = parse_time(self.rows[-1]["end"].get())
+            start_minutes = time_to_minutes(previous_end) if previous_end else 8 * 60
+        else:
+            start_minutes = 8 * 60
+        end_minutes = start_minutes + 45
+        if end_minutes >= 24 * 60:
+            start_minutes = 8 * 60
+            end_minutes = 8 * 60 + 45
+        return minutes_to_time(start_minutes), minutes_to_time(end_minutes)
+
+    def _add_row(self, start=None, end=None, scroll=True):
+        default_start, default_end = self._default_times()
+        start = parse_time(start) or default_start
+        end = parse_time(end) or default_end
+        if time_to_minutes(start) >= time_to_minutes(end):
+            end = minutes_to_time(time_to_minutes(start) + 45)
+
+        frame = ttk.Frame(self.inner)
+        frame.pack(fill="x", pady=3)
+        label = ttk.Label(frame, text="", width=9)
+        label.pack(side="left")
+        start_var = tk.StringVar(value=start)
+        end_var = tk.StringVar(value=end)
+        start_entry = ttk.Entry(frame, textvariable=start_var, width=11)
+        start_entry.pack(side="left", padx=(8, 0))
+        ttk.Label(frame, text="—").pack(side="left", padx=(10, 0))
+        end_entry = ttk.Entry(frame, textvariable=end_var, width=11)
+        end_entry.pack(side="left", padx=(10, 0))
+        ttk.Button(
+            frame, text="删除", width=8,
+            command=lambda: self._delete_row(row),
+        ).pack(side="left", padx=(24, 0))
+
+        row = {
+            "frame": frame,
+            "label": label,
+            "start": start_var,
+            "end": end_var,
+            "start_entry": start_entry,
+            "end_entry": end_entry,
+        }
+        self.rows.append(row)
+        if scroll:
+            self.after(30, self._scroll_to_bottom)
+        return row
+
+    def _scroll_to_bottom(self):
+        try:
+            self.canvas.update_idletasks()
+            self.canvas.yview_moveto(1.0)
+        except tk.TclError:
+            pass
+
+    def _delete_row(self, row):
+        if row not in self.rows:
+            return
+        try:
+            row["frame"].destroy()
+        except tk.TclError:
+            pass
+        self.rows.remove(row)
+        self._renumber()
+
+    def _renumber(self):
+        for index, row in enumerate(self.rows, start=1):
+            row["label"].configure(text="第%d节" % index)
+        self.count_label.configure(text="共 %d 节" % len(self.rows))
+
+    def _save(self):
+        rows = []
+        for index, row in enumerate(self.rows, start=1):
+            start = parse_time(row["start"].get())
+            end = parse_time(row["end"].get())
+            if start is None or end is None:
+                messagebox.showerror(
+                    APP_TITLE, "第%d节的开始或结束时间格式不正确，请使用 HH:MM。" % index,
+                    parent=self)
+                (row["start_entry"] if start is None else row["end_entry"]).focus_set()
+                return
+            if time_to_minutes(start) >= time_to_minutes(end):
+                messagebox.showerror(
+                    APP_TITLE, "第%d节的结束时间必须晚于开始时间。" % index, parent=self)
+                row["end_entry"].focus_set()
+                return
+            rows.append({"start": start, "end": end})
+        self.result = normalize_schedule(rows)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class TimetableWindow:
-    """网格化课表：固定 12 节、周一至周日，支持跨节次合并与垂直滚动。"""
+    """网格化课表：按 schedule.json 动态生成节次，支持跨节次合并与滚动。"""
 
     PERIOD_WIDTH = 94
     ROW_HEIGHT = 64
@@ -857,6 +1085,8 @@ class TimetableWindow:
     def __init__(self, app, parent, courses):
         self.app = app
         self.courses = courses
+        self.schedule = normalize_schedule(getattr(app, "schedule", []) or [])
+        self.period_count = len(self.schedule)
         self.win = tk.Toplevel(parent)
         self.win.title("课程表")
         self.win.configure(bg="#ffffff")
@@ -869,7 +1099,7 @@ class TimetableWindow:
         self.win_h = max(620, min(int(screen_h * 0.62), 1100))
         self.day_w = max(110, min(190, int((self.win_w - 120) / 7)))
         self.total_w = self.PERIOD_WIDTH + 7 * self.day_w
-        self.total_h = 12 * self.ROW_HEIGHT
+        self.total_h = max(80, self.period_count * self.ROW_HEIGHT)
 
         x = max(0, (screen_w - self.win_w) // 2)
         y = max(0, (screen_h - self.win_h) // 3)
@@ -958,7 +1188,23 @@ class TimetableWindow:
             self.PERIOD_WIDTH / 2, 22, text="节次",
             font=("Microsoft YaHei UI", 10, "bold"), fill="#334155")
 
-        for row in range(12):
+        self.period_count = len(self.schedule)
+        if not self.schedule:
+            self.total_h = 100
+            self.canvas.create_text(
+                self.total_w / 2, 32, text="请先设置作息时间表",
+                font=("Microsoft YaHei UI", 15, "bold"), fill="#334155")
+            self.canvas.create_text(
+                self.total_w / 2, 66,
+                text="点击主界面的“设置每日作息”，自由添加节次和起止时间。",
+                font=("Microsoft YaHei UI", 9), fill="#64748b")
+            self.canvas.configure(scrollregion=(0, 0, self.total_w, self.total_h))
+            return
+
+        self.total_h = self.period_count * self.ROW_HEIGHT
+        for row, period in enumerate(self.schedule):
+            period_start = period["start"]
+            period_end = period["end"]
             y1 = row * self.ROW_HEIGHT
             y2 = y1 + self.ROW_HEIGHT
             fill = "#ffffff" if row % 2 == 0 else "#fbfcfe"
@@ -969,13 +1215,13 @@ class TimetableWindow:
                 font=("Microsoft YaHei UI", 9, "bold"), fill="#334155")
             self.canvas.create_text(
                 self.PERIOD_WIDTH / 2, y1 + 40,
-                text="%s-%s" % PERIODS[row],
+                text="%s-%s" % (period_start, period_end),
                 font=("Microsoft YaHei UI", 7), fill="#64748b")
 
         for day in range(1, 8):
             x = self.PERIOD_WIDTH + day * self.day_w
             self.canvas.create_line(x, 0, x, self.total_h, fill="#dbe2ea")
-        for row in range(1, 12):
+        for row in range(1, self.period_count):
             y = row * self.ROW_HEIGHT
             self.canvas.create_line(0, y, self.total_w, y, fill="#dbe2ea")
 
@@ -985,6 +1231,10 @@ class TimetableWindow:
             if weekday not in by_day:
                 continue
             period_from, period_to = resolve_course_periods(course)
+            if period_from is None or period_to is None:
+                continue
+            period_from = max(1, min(self.period_count, period_from))
+            period_to = max(period_from, min(self.period_count, period_to))
             by_day[weekday].append({
                 "course": course,
                 "from": period_from,
@@ -1037,8 +1287,10 @@ class TimetableWindow:
                             )
         self.canvas.configure(scrollregion=(0, 0, self.total_w, self.total_h))
 
-    def refresh(self, courses):
+    def refresh(self, courses, schedule=None):
         self.courses = courses
+        if schedule is not None:
+            self.schedule = normalize_schedule(schedule)
         self._draw()
 
     def close(self):
@@ -1462,6 +1714,7 @@ class CourseReminderApp:
     def __init__(self, root):
         self.root = root
         self.courses = []
+        self.schedule = []
         self.term_start = None
         self.config = {"default_template": DEFAULT_TEMPLATE,
                        "extra_template": DEFAULT_EXTRA_TEMPLATE}
@@ -1554,6 +1807,8 @@ class CourseReminderApp:
         ttk.Button(toolbar, text="删除课程", command=self.delete_course).pack(
             side="left", padx=(8, 0))
         ttk.Button(toolbar, text="查看课表", command=self.show_timetable).pack(
+            side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="设置每日作息", command=self.open_schedule_dialog).pack(
             side="left", padx=(8, 0))
         self.count_label = ttk.Label(toolbar, text="", style="Hint.TLabel")
         self.count_label.pack(side="right")
@@ -1652,6 +1907,7 @@ class CourseReminderApp:
     # ------------------------------ 数据 ------------------------------
 
     def _load_all(self):
+        self.schedule = load_schedule()
         raw_courses = load_json(COURSES_PATH, None)
         if isinstance(raw_courses, list):
             self.term_start = None
@@ -1751,7 +2007,7 @@ class CourseReminderApp:
         if self.timetable_window is not None:
             try:
                 if self.timetable_window.win.winfo_exists():
-                    self.timetable_window.refresh(self.courses)
+                    self.timetable_window.refresh(self.courses, self.schedule)
                 else:
                     self.timetable_window = None
             except tk.TclError:
@@ -1786,13 +2042,37 @@ class CourseReminderApp:
         if self.timetable_window is not None:
             try:
                 if self.timetable_window.win.winfo_exists():
-                    self.timetable_window.refresh(self.courses)
+                    self.timetable_window.refresh(self.courses, self.schedule)
                     self.timetable_window.win.lift()
                     return
             except tk.TclError:
                 pass
             self.timetable_window = None
         self.timetable_window = TimetableWindow(self, self.root, self.courses)
+
+    def open_schedule_dialog(self):
+        dialog = ScheduleDialog(self.root, self.schedule)
+        self.root.wait_window(dialog)
+        if dialog.result is None:
+            return
+        normalized = normalize_schedule(dialog.result)
+        try:
+            save_json(SCHEDULE_PATH, normalized)
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, "保存 schedule.json 失败：%s" % exc,
+                                 parent=self.root)
+            return
+        self.schedule = set_periods(normalized)
+        if self.timetable_window is not None:
+            try:
+                if self.timetable_window.win.winfo_exists():
+                    self.timetable_window.refresh(self.courses, self.schedule)
+            except tk.TclError:
+                self.timetable_window = None
+        if self.schedule:
+            self._set_status("已保存作息时间表：共 %d 节" % len(self.schedule))
+        else:
+            self._set_status("作息时间表为空，打开课表会提示先设置")
 
     # ------------------------------ 课程操作 ------------------------------
 
