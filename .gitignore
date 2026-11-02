@@ -1,0 +1,25 @@
+# 个人课程数据，绝不发布
+courses.json
+holidays.json
+makeup.json
+config.json
+
+# 个人桌宠素材，绝不发布
+assets/pet.png
+
+# 构建产物
+dist/
+build/
+*.spec
+*.exe
+__pycache__/
+*.py[cod]
+.build_deps/
+.venv/
+venv/
+
+# 常见编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,25 @@
+{
+  "term_start": "",
+  "courses": [
+    {
+      "name": "高等数学（示例）",
+      "weekday": 1,
+      "start": "08:05",
+      "end": "09:35",
+      "place": "示例教学楼 A101",
+      "advance": 10,
+      "weeks": "all",
+      "text": "",
+      "period_from": null,
+      "period_to": null,
+      "extra_enabled": true,
+      "extra_count": 1,
+      "extras": [
+        {
+          "advance": 30,
+          "text": ""
+        }
+      ]
+    }
+  ]
+}
