@@ -40,6 +40,7 @@ WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "�
 # PERIODS / PERIOD_LABELS 在载入 schedule.json 后动态生成。
 PERIODS = ()
 PERIOD_LABELS = ["自动识别"]
+MAX_PERIODS = 20
 BUBBLE_MAX_WIDTH = 350
 REMINDER_DISPLAY_MS = 60000       # 每次弹出停留 60 秒
 REMINDER_SNOOZE_MS = 180000       # 自动隐藏后 180 秒重弹
@@ -120,7 +121,7 @@ def normalize_schedule(raw):
         rows.append({"start": start, "end": end})
     rows.sort(key=lambda row: (time_to_minutes(row["start"]),
                                time_to_minutes(row["end"])))
-    return rows
+    return rows[:MAX_PERIODS]
 
 
 def set_periods(periods):
@@ -943,14 +944,14 @@ class ScheduleDialog(tk.Toplevel):
 
         bottom = ttk.Frame(outer)
         bottom.pack(fill="x", pady=(10, 0))
-        ttk.Button(bottom, text="添加节次", command=self._add_row).pack(side="left")
+        ttk.Button(bottom, text="+ 添加一节", command=self._add_row).pack(side="left")
         ttk.Button(bottom, text="取消", command=self._cancel).pack(
             side="right", padx=(8, 0))
         ttk.Button(bottom, text="保存作息", command=self._save).pack(side="right")
         self.count_label = ttk.Label(bottom, text="", style="Hint.TLabel")
         self.count_label.pack(side="left", padx=(12, 0))
 
-        for item in periods or []:
+        for item in (periods or [])[:MAX_PERIODS]:
             self._add_row(item.get("start"), item.get("end"), scroll=False)
         if not self.rows:
             self._add_row()
@@ -994,6 +995,9 @@ class ScheduleDialog(tk.Toplevel):
         return minutes_to_time(start_minutes), minutes_to_time(end_minutes)
 
     def _add_row(self, start=None, end=None, scroll=True):
+        if len(self.rows) >= MAX_PERIODS:
+            messagebox.showinfo(APP_TITLE, "最多只能设置20节课", parent=self)
+            return None
         default_start, default_end = self._default_times()
         start = parse_time(start) or default_start
         end = parse_time(end) or default_end
@@ -1011,10 +1015,6 @@ class ScheduleDialog(tk.Toplevel):
         ttk.Label(frame, text="—").pack(side="left", padx=(10, 0))
         end_entry = ttk.Entry(frame, textvariable=end_var, width=11)
         end_entry.pack(side="left", padx=(10, 0))
-        ttk.Button(
-            frame, text="删除", width=8,
-            command=lambda: self._delete_row(row),
-        ).pack(side="left", padx=(24, 0))
 
         row = {
             "frame": frame,
@@ -1025,6 +1025,11 @@ class ScheduleDialog(tk.Toplevel):
             "end_entry": end_entry,
         }
         self.rows.append(row)
+        ttk.Button(
+            frame, text="删除", width=8,
+            command=lambda r=row: self._delete_row(r),
+        ).pack(side="left", padx=(24, 0))
+        self._renumber()
         if scroll:
             self.after(30, self._scroll_to_bottom)
         return row
@@ -1049,7 +1054,8 @@ class ScheduleDialog(tk.Toplevel):
     def _renumber(self):
         for index, row in enumerate(self.rows, start=1):
             row["label"].configure(text="第%d节" % index)
-        self.count_label.configure(text="共 %d 节" % len(self.rows))
+        self.count_label.configure(
+            text="共 %d 节（上限 %d 节）" % (len(self.rows), MAX_PERIODS))
 
     def _save(self):
         rows = []
