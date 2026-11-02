@@ -888,18 +888,26 @@ class ReminderWindow:
 
 
 class ScheduleDialog(tk.Toplevel):
-    """自由添加、删除节次并设置起止时间的作息表编辑器。"""
+    """自由添加、删除节次并设置起止时间的作息表编辑器。
+
+    交互规则：
+    - 初始只有第 1 节，开始/结束都有效时自动追加下一节（最多 20 节）。
+    - 中间的列表区域独立滚动，底部“确定/取消”固定，不会被内容顶出窗口。
+    - 保存时忽略底部没有填写时间的空行。
+    """
 
     def __init__(self, parent, periods):
         super().__init__(parent)
         self.result = None
         self.rows = []
+        self._building = True
+        self._auto_job = None
         self.title("设置每日作息")
         self.resizable(True, True)
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
-        self.geometry("720x580")
-        self.minsize(620, 420)
+        self.geometry("560x640")
+        self.minsize(520, 520)
 
         outer = ttk.Frame(self, padding=(14, 12, 14, 10))
         outer.pack(fill="both", expand=True)
@@ -907,10 +915,19 @@ class ScheduleDialog(tk.Toplevel):
                   style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             outer,
-            text="自由添加或删除节次，并填写每节课的开始、结束时间（HH:MM）。"
-                 "保存后课表会按这里的节次数量自动重绘。",
-            style="Hint.TLabel", wraplength=660,
-        ).pack(anchor="w", pady=(4, 10))
+            text="填写开始和结束时间后，下方会自动追加下一节（最多 20 节）。"
+                 "底部的空行不会保存。",
+            style="Hint.TLabel", wraplength=510,
+        ).pack(anchor="w", pady=(4, 8))
+
+        # 先固定底部操作栏，再让列表区域占据剩余空间，窗口变矮也不会遮住“确定”。
+        bottom = ttk.Frame(outer)
+        bottom.pack(side="bottom", fill="x", pady=(10, 0))
+        self.count_label = ttk.Label(bottom, text="", style="Hint.TLabel")
+        self.count_label.pack(side="left")
+        ttk.Button(bottom, text="取消", command=self._cancel).pack(
+            side="right", padx=(8, 0))
+        ttk.Button(bottom, text="确定", command=self._save).pack(side="right")
 
         table_head = ttk.Frame(outer)
         table_head.pack(fill="x", pady=(0, 4))
@@ -920,7 +937,7 @@ class ScheduleDialog(tk.Toplevel):
         ttk.Label(table_head, text="操作", width=10).pack(side="left", padx=(28, 0))
 
         body = ttk.Frame(outer)
-        body.pack(fill="both", expand=True)
+        body.pack(side="top", fill="both", expand=True)
         self.canvas = tk.Canvas(body, bg="#ffffff", highlightthickness=1,
                                 highlightbackground="#dbe2ea", bd=0)
         scrollbar = ttk.Scrollbar(body, orient="vertical",
@@ -942,24 +959,18 @@ class ScheduleDialog(tk.Toplevel):
         self.bind("<MouseWheel>", self._on_mousewheel)
         self.bind("<Escape>", lambda _event: self._cancel())
 
-        bottom = ttk.Frame(outer)
-        bottom.pack(fill="x", pady=(10, 0))
-        ttk.Button(bottom, text="+ 添加一节", command=self._add_row).pack(side="left")
-        ttk.Button(bottom, text="取消", command=self._cancel).pack(
-            side="right", padx=(8, 0))
-        ttk.Button(bottom, text="保存作息", command=self._save).pack(side="right")
-        self.count_label = ttk.Label(bottom, text="", style="Hint.TLabel")
-        self.count_label.pack(side="left", padx=(12, 0))
-
+        # 已有作息直接显示；最后一行完整时补一个空行，方便继续添加。
         for item in (periods or [])[:MAX_PERIODS]:
-            self._add_row(item.get("start"), item.get("end"), scroll=False)
+            self._append_row(item.get("start"), item.get("end"),
+                             blank=False, scroll=False)
         if not self.rows:
-            self._add_row()
+            self._append_row(blank=True, scroll=False)
+        self._building = False
         self._renumber()
 
         self.update_idletasks()
-        width = self.winfo_reqwidth()
-        height = self.winfo_reqheight()
+        width = max(560, self.winfo_reqwidth())
+        height = max(640, self.winfo_reqheight())
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
         x = min(max(0, parent.winfo_rootx() + (parent.winfo_width() - width) // 2),
@@ -967,6 +978,7 @@ class ScheduleDialog(tk.Toplevel):
         y = min(max(0, parent.winfo_rooty() + (parent.winfo_height() - height) // 3),
                 max(0, screen_h - height - 60))
         self.geometry("+%d+%d" % (x, y))
+        self.after(80, self._maybe_append)
         self.after(50, self._activate)
 
     def _activate(self):
@@ -982,34 +994,21 @@ class ScheduleDialog(tk.Toplevel):
         if delta:
             self.canvas.yview_scroll(delta, "units")
 
-    def _default_times(self):
-        if self.rows:
-            previous_end = parse_time(self.rows[-1]["end"].get())
-            start_minutes = time_to_minutes(previous_end) if previous_end else 8 * 60
-        else:
-            start_minutes = 8 * 60
-        end_minutes = start_minutes + 45
-        if end_minutes >= 24 * 60:
-            start_minutes = 8 * 60
-            end_minutes = 8 * 60 + 45
-        return minutes_to_time(start_minutes), minutes_to_time(end_minutes)
-
-    def _add_row(self, start=None, end=None, scroll=True):
+    def _append_row(self, start=None, end=None, blank=False, scroll=True):
         if len(self.rows) >= MAX_PERIODS:
-            messagebox.showinfo(APP_TITLE, "最多只能设置20节课", parent=self)
             return None
-        default_start, default_end = self._default_times()
-        start = parse_time(start) or default_start
-        end = parse_time(end) or default_end
-        if time_to_minutes(start) >= time_to_minutes(end):
-            end = minutes_to_time(time_to_minutes(start) + 45)
+        if blank:
+            start_value, end_value = "", ""
+        else:
+            start_value = parse_time(start) or ""
+            end_value = parse_time(end) or ""
 
         frame = ttk.Frame(self.inner)
         frame.pack(fill="x", pady=3)
         label = ttk.Label(frame, text="", width=9)
         label.pack(side="left")
-        start_var = tk.StringVar(value=start)
-        end_var = tk.StringVar(value=end)
+        start_var = tk.StringVar(value=start_value)
+        end_var = tk.StringVar(value=end_value)
         start_entry = ttk.Entry(frame, textvariable=start_var, width=11)
         start_entry.pack(side="left", padx=(8, 0))
         ttk.Label(frame, text="—").pack(side="left", padx=(10, 0))
@@ -1029,10 +1028,46 @@ class ScheduleDialog(tk.Toplevel):
             frame, text="删除", width=8,
             command=lambda r=row: self._delete_row(r),
         ).pack(side="left", padx=(24, 0))
+
+        start_var.trace_add("write", self._schedule_auto_append)
+        end_var.trace_add("write", self._schedule_auto_append)
         self._renumber()
         if scroll:
             self.after(30, self._scroll_to_bottom)
         return row
+
+    def _row_complete(self, row):
+        start = parse_time(row["start"].get())
+        end = parse_time(row["end"].get())
+        return bool(start and end and
+                    time_to_minutes(start) < time_to_minutes(end))
+
+    def _schedule_auto_append(self, *_args):
+        if self._building:
+            return
+        if self._auto_job is not None:
+            try:
+                self.after_cancel(self._auto_job)
+            except tk.TclError:
+                pass
+        self._auto_job = self.after(120, self._maybe_append)
+
+    def _cancel_auto(self):
+        if self._auto_job is not None:
+            try:
+                self.after_cancel(self._auto_job)
+            except tk.TclError:
+                pass
+            self._auto_job = None
+
+    def _maybe_append(self):
+        self._auto_job = None
+        if self._building or not self.rows:
+            return
+        if len(self.rows) >= MAX_PERIODS:
+            return
+        if self._row_complete(self.rows[-1]):
+            self._append_row(blank=True, scroll=True)
 
     def _scroll_to_bottom(self):
         try:
@@ -1050,27 +1085,35 @@ class ScheduleDialog(tk.Toplevel):
             pass
         self.rows.remove(row)
         self._renumber()
+        self._schedule_auto_append()
 
     def _renumber(self):
         for index, row in enumerate(self.rows, start=1):
             row["label"].configure(text="第%d节" % index)
         self.count_label.configure(
-            text="共 %d 节（上限 %d 节）" % (len(self.rows), MAX_PERIODS))
+            text="共 %d 行（最多 %d 行，空行不保存）" % (
+                len(self.rows), MAX_PERIODS))
 
     def _save(self):
+        self._cancel_auto()
         rows = []
         for index, row in enumerate(self.rows, start=1):
             start = parse_time(row["start"].get())
             end = parse_time(row["end"].get())
-            if start is None or end is None:
+            if not start and not end:
+                # 自动追加出来但还没填写的空行直接忽略。
+                continue
+            if not start or not end:
                 messagebox.showerror(
-                    APP_TITLE, "第%d节的开始或结束时间格式不正确，请使用 HH:MM。" % index,
+                    APP_TITLE,
+                    "第%d节的开始和结束时间需要同时填写，或整行留空。" % index,
                     parent=self)
-                (row["start_entry"] if start is None else row["end_entry"]).focus_set()
+                (row["start_entry"] if not start else row["end_entry"]).focus_set()
                 return
             if time_to_minutes(start) >= time_to_minutes(end):
                 messagebox.showerror(
-                    APP_TITLE, "第%d节的结束时间必须晚于开始时间。" % index, parent=self)
+                    APP_TITLE, "第%d节的结束时间必须晚于开始时间。" % index,
+                    parent=self)
                 row["end_entry"].focus_set()
                 return
             rows.append({"start": start, "end": end})
@@ -1078,6 +1121,7 @@ class ScheduleDialog(tk.Toplevel):
         self.destroy()
 
     def _cancel(self):
+        self._cancel_auto()
         self.result = None
         self.destroy()
 
@@ -2079,6 +2123,7 @@ class CourseReminderApp:
             self._set_status("已保存作息时间表：共 %d 节" % len(self.schedule))
         else:
             self._set_status("作息时间表为空，打开课表会提示先设置")
+        messagebox.showinfo(APP_TITLE, "作息时间表更新成功", parent=self.root)
 
     # ------------------------------ 课程操作 ------------------------------
 
