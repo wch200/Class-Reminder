@@ -1888,6 +1888,10 @@ class CourseReminderApp:
         self.tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", lambda _event: self.edit_course())
+        # 鼠标放在课程列表上即可用滚轮上下滑动，不必去拖右侧滚动条。
+        self.tree.bind("<MouseWheel>", self._on_course_wheel)
+        self.tree.bind("<Button-4>", lambda _event: self.tree.yview_scroll(-1, "units"))
+        self.tree.bind("<Button-5>", lambda _event: self.tree.yview_scroll(1, "units"))
 
         settings = ttk.LabelFrame(outer, text="设置", padding=10)
         settings.pack(fill="x", pady=(0, 8))
@@ -1953,6 +1957,13 @@ class CourseReminderApp:
         self.stop_button.pack(side="left", padx=(8, 0))
         ttk.Label(reminder_bar, text="关闭主程序即停止提醒",
                   style="Hint.TLabel").pack(side="right")
+
+    def _on_course_wheel(self, event):
+        """课程列表的滚轮滚动：每格 120 单位折合一行。"""
+        delta = int(-1 * (event.delta / 120)) if event.delta else 0
+        if delta:
+            self.tree.yview_scroll(delta, "units")
+        return "break"
 
     # ------------------------------ 数据 ------------------------------
 
