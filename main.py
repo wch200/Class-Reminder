@@ -888,24 +888,29 @@ class ReminderWindow:
 
 
 class ScheduleDialog(tk.Toplevel):
-    """自由添加、删除节次并设置起止时间的作息表编辑器。
+    """自由添加、删除节次并设置起止时间的作息表编辑器（无感自动保存）。
 
     交互规则：
     - 初始只有第 1 节，开始/结束都有效时自动追加下一节（最多 20 节）。
-    - 中间的列表区域独立滚动，底部“确定/取消”固定，不会被内容顶出窗口。
-    - 保存时忽略底部没有填写时间的空行。
+    - 没有“确定”按钮：输入框失去焦点或停止输入约 0.7 秒后，立即静默写入
+      schedule.json；点“关闭”或右上角 X 也只是结束窗口，数据早已存好。
+    - 保存时自动过滤开始或结束时间为空的半行，以及结束早于开始的无效行。
     """
 
-    def __init__(self, parent, periods):
+    def __init__(self, parent, periods, on_saved=None):
         super().__init__(parent)
         self.result = None
         self.rows = []
         self._building = True
         self._auto_job = None
+        self._save_job = None
+        self._saving = False
+        self._last_saved = None
+        self.on_saved = on_saved
         self.title("设置每日作息")
         self.resizable(True, True)
         self.transient(parent)
-        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.protocol("WM_DELETE_WINDOW", self._close)
         self.geometry("560x640")
         self.minsize(520, 520)
 
@@ -915,19 +920,19 @@ class ScheduleDialog(tk.Toplevel):
                   style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             outer,
-            text="填写开始和结束时间后，下方会自动追加下一节（最多 20 节）。"
-                 "底部的空行不会保存。",
+            text="填写时间后会自动保存，无需点“确定”：输入框失去焦点（点别处）"
+                 "或停止输入片刻即写入 schedule.json。开始/结束时间为空的行会被忽略。",
             style="Hint.TLabel", wraplength=510,
         ).pack(anchor="w", pady=(4, 8))
 
-        # 先固定底部操作栏，再让列表区域占据剩余空间，窗口变矮也不会遮住“确定”。
+        # 只保留“关闭”按钮；真正的保存发生在输入过程中。
         bottom = ttk.Frame(outer)
         bottom.pack(side="bottom", fill="x", pady=(10, 0))
         self.count_label = ttk.Label(bottom, text="", style="Hint.TLabel")
         self.count_label.pack(side="left")
-        ttk.Button(bottom, text="取消", command=self._cancel).pack(
-            side="right", padx=(8, 0))
-        ttk.Button(bottom, text="确定", command=self._save).pack(side="right")
+        self.save_label = ttk.Label(bottom, text="自动保存已开启", style="Hint.TLabel")
+        self.save_label.pack(side="left", padx=(12, 0))
+        ttk.Button(bottom, text="关闭", command=self._close).pack(side="right")
 
         table_head = ttk.Frame(outer)
         table_head.pack(fill="x", pady=(0, 4))
@@ -957,7 +962,7 @@ class ScheduleDialog(tk.Toplevel):
             lambda event: self.canvas.itemconfigure(self.window_id, width=event.width))
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.bind("<MouseWheel>", self._on_mousewheel)
-        self.bind("<Escape>", lambda _event: self._cancel())
+        self.bind("<Escape>", lambda _event: self._close())
 
         # 已有作息直接显示；最后一行完整时补一个空行，方便继续添加。
         for item in (periods or [])[:MAX_PERIODS]:
@@ -1031,6 +1036,13 @@ class ScheduleDialog(tk.Toplevel):
 
         start_var.trace_add("write", self._schedule_auto_append)
         end_var.trace_add("write", self._schedule_auto_append)
+        start_var.trace_add("write", self._schedule_auto_save)
+        end_var.trace_add("write", self._schedule_auto_save)
+        # 焦点离开输入框（点别处、切到别的行、点关闭）立刻静默保存。
+        start_entry.bind("<FocusOut>", self._auto_save)
+        end_entry.bind("<FocusOut>", self._auto_save)
+        start_entry.bind("<Return>", self._auto_save)
+        end_entry.bind("<Return>", self._auto_save)
         self._renumber()
         if scroll:
             self.after(30, self._scroll_to_bottom)
@@ -1086,6 +1098,7 @@ class ScheduleDialog(tk.Toplevel):
         self.rows.remove(row)
         self._renumber()
         self._schedule_auto_append()
+        self._schedule_auto_save()
 
     def _renumber(self):
         for index, row in enumerate(self.rows, start=1):
@@ -1094,35 +1107,66 @@ class ScheduleDialog(tk.Toplevel):
             text="共 %d 行（最多 %d 行，空行不保存）" % (
                 len(self.rows), MAX_PERIODS))
 
-    def _save(self):
-        self._cancel_auto()
+    def _schedule_auto_save(self, *_args):
+        """停止输入约 0.7 秒后再保存，避免每敲一个字符就写一次盘。"""
+        if self._building:
+            return
+        if self._save_job is not None:
+            try:
+                self.after_cancel(self._save_job)
+            except tk.TclError:
+                pass
+        self._save_job = self.after(700, self._auto_save)
+
+    def _auto_save(self, _event=None):
+        """静默保存：只写完整且有效的行，界面保持不动，也不弹任何提示。"""
+        if self._save_job is not None:
+            try:
+                self.after_cancel(self._save_job)
+            except tk.TclError:
+                pass
+            self._save_job = None
+        if self._building or self._saving:
+            return
         rows = []
-        for index, row in enumerate(self.rows, start=1):
+        for row in self.rows:
             start = parse_time(row["start"].get())
             end = parse_time(row["end"].get())
-            if not start and not end:
-                # 自动追加出来但还没填写的空行直接忽略。
-                continue
+            # 半行、空行、结束不晚于开始的行一律跳过，不打扰用户。
             if not start or not end:
-                messagebox.showerror(
-                    APP_TITLE,
-                    "第%d节的开始和结束时间需要同时填写，或整行留空。" % index,
-                    parent=self)
-                (row["start_entry"] if not start else row["end_entry"]).focus_set()
-                return
+                continue
             if time_to_minutes(start) >= time_to_minutes(end):
-                messagebox.showerror(
-                    APP_TITLE, "第%d节的结束时间必须晚于开始时间。" % index,
-                    parent=self)
-                row["end_entry"].focus_set()
-                return
+                continue
             rows.append({"start": start, "end": end})
-        self.result = normalize_schedule(rows)
-        self.destroy()
+        normalized = normalize_schedule(rows)
+        if normalized == self._last_saved:
+            return
+        self._saving = True
+        try:
+            save_json(SCHEDULE_PATH, normalized)
+        except OSError as exc:
+            self._saving = False
+            self.save_label.configure(text="自动保存失败：%s" % exc)
+            return
+        self._saving = False
+        self._last_saved = normalized
+        self.result = normalized
+        self.save_label.configure(
+            text="已自动保存 %d 节 · %s" % (
+                len(normalized), time.strftime("%H:%M:%S")))
+        if self.on_saved is not None:
+            try:
+                self.on_saved(normalized)
+            except Exception:
+                pass
 
-    def _cancel(self):
+    def _close(self):
+        """关闭窗口前再补一次保存，点 X、按 Esc、点“关闭”都不会丢数据。"""
+        try:
+            self._auto_save()
+        except Exception:
+            pass
         self._cancel_auto()
-        self.result = None
         self.destroy()
 
 
@@ -2111,30 +2155,31 @@ class CourseReminderApp:
             self.timetable_window = None
         self.timetable_window = TimetableWindow(self, self.root, self.courses)
 
-    def open_schedule_dialog(self):
-        dialog = ScheduleDialog(self.root, self.schedule)
-        self.root.wait_window(dialog)
-        if dialog.result is None:
-            return
-        normalized = normalize_schedule(dialog.result)
+    def _on_schedule_saved(self, _periods=None):
+        """作息表被自动保存后，主界面与“网格化课表”实时跟随刷新。"""
         try:
-            save_json(SCHEDULE_PATH, normalized)
-        except OSError as exc:
-            messagebox.showerror(APP_TITLE, "保存 schedule.json 失败：%s" % exc,
-                                 parent=self.root)
+            self.schedule = load_schedule()
+        except OSError:
             return
-        self.schedule = set_periods(normalized)
         if self.timetable_window is not None:
             try:
                 if self.timetable_window.win.winfo_exists():
                     self.timetable_window.refresh(self.courses, self.schedule)
+                else:
+                    self.timetable_window = None
             except tk.TclError:
                 self.timetable_window = None
         if self.schedule:
-            self._set_status("已保存作息时间表：共 %d 节" % len(self.schedule))
+            self._set_status("作息时间表已自动保存：共 %d 节" % len(self.schedule))
         else:
             self._set_status("作息时间表为空，打开课表会提示先设置")
-        messagebox.showinfo(APP_TITLE, "作息时间表更新成功", parent=self.root)
+
+    def open_schedule_dialog(self):
+        # 自动保存模式下窗口没有“确定”，关闭即生效；on_saved 负责实时刷新。
+        dialog = ScheduleDialog(self.root, self.schedule,
+                                on_saved=self._on_schedule_saved)
+        self.root.wait_window(dialog)
+        self._on_schedule_saved(dialog.result)
 
     # ------------------------------ 课程操作 ------------------------------
 
