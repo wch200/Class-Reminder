@@ -6,6 +6,7 @@ Windows 本地独立运行的课程提醒程序。
 除首次自动下载节假日 JSON 外不联网，全程静音。
 """
 
+import ctypes
 import datetime as dt
 import json
 import math
@@ -385,6 +386,7 @@ def normalize_course(raw):
         "text": str(raw.get("text", "")).strip(),
         "period_from": period_from,
         "period_to": period_to,
+        "is_evening_study": bool(raw.get("is_evening_study", False)),
         "extra_enabled": extra_enabled,
         "extra_count": extra_count,
         "extras": extras,
@@ -555,6 +557,119 @@ def enable_dpi_awareness():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+
+
+class SingleInstance:
+    """单例 + 唤醒：命名互斥体判断是否已有实例，命名事件通知旧实例显示窗口。
+
+    第一个进程创建互斥体并持有；之后双击 exe 的新进程会发现互斥体已存在，
+    于是 SetEvent 唤醒旧进程，自己立即退出。旧进程后台线程收到信号后，
+    只设置一个标志位，由 Tk 主线程的轻量定时器完成 deiconify，避免跨线程操作控件。
+    """
+
+    MUTEX_NAME = r"Local\ClassReminder_SingleInstance_Mutex"
+    EVENT_NAME = r"Local\ClassReminder_SingleInstance_Wake"
+    ERROR_ALREADY_EXISTS = 183
+    EVENT_MODIFY_STATE = 0x0002
+    WAIT_OBJECT_0 = 0
+    INFINITE = 0xFFFFFFFF
+
+    def __init__(self):
+        self.enabled = False
+        self.already_running = False
+        self.mutex = None
+        self.event = None
+        self._kernel32 = None
+        self._ctypes = None
+        self._watcher = None
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.CreateMutexW.argtypes = [
+                ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+            kernel32.CreateEventW.restype = ctypes.c_void_p
+            kernel32.CreateEventW.argtypes = [
+                ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+            kernel32.OpenEventW.restype = ctypes.c_void_p
+            kernel32.OpenEventW.argtypes = [
+                ctypes.c_uint32, ctypes.c_bool, ctypes.c_wchar_p]
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.SetEvent.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+            mutex = kernel32.CreateMutexW(None, False, self.MUTEX_NAME)
+            last_error = kernel32.GetLastError()
+            if not mutex:
+                return
+            self.mutex = mutex
+            self.already_running = (last_error == self.ERROR_ALREADY_EXISTS)
+            self.event = kernel32.CreateEventW(
+                None, False, False, self.EVENT_NAME)
+            self._kernel32 = kernel32
+            self._ctypes = ctypes
+            self.enabled = True
+        except Exception:
+            self.enabled = False
+
+    def signal_existing(self):
+        """通知已在运行的实例显示主窗口；成功返回 True。"""
+        if not self.enabled or self._kernel32 is None:
+            return False
+        try:
+            handle = self._kernel32.OpenEventW(
+                self.EVENT_MODIFY_STATE, False, self.EVENT_NAME)
+            if not handle:
+                return False
+            try:
+                self._kernel32.SetEvent(handle)
+            finally:
+                self._kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+
+    def start_watcher(self, callback):
+        """后台线程等待唤醒事件；回调里只应做线程安全的轻量操作。"""
+        if not self.enabled or not self.event:
+            return
+        kernel32 = self._kernel32
+        event_handle = self.event
+        infinite = self.INFINITE
+        wait_object_0 = self.WAIT_OBJECT_0
+        c_void_p = self._ctypes.c_void_p
+
+        def run():
+            while True:
+                try:
+                    result = kernel32.WaitForSingleObject(
+                        c_void_p(event_handle), infinite)
+                except Exception:
+                    return
+                if result != wait_object_0:
+                    return
+                try:
+                    callback()
+                except Exception:
+                    pass
+
+        self._watcher = threading.Thread(
+            target=run, name="singleton-wake", daemon=True)
+        self._watcher.start()
+
+    def close(self):
+        kernel32 = self._kernel32
+        if kernel32 is None:
+            return
+        for handle in (self.event, self.mutex):
+            if handle:
+                try:
+                    kernel32.CloseHandle(handle)
+                except Exception:
+                    pass
+        self.event = None
+        self.mutex = None
+        self.enabled = False
 
 
 # ---------------------------------------------------------------------------
@@ -1264,6 +1379,67 @@ class TimetableWindow:
                 entry["lane"] = len(lanes) - 1
         return max(1, len(lanes))
 
+    def _evening_geometry(self, course):
+        """晚自习课：按真实开始/结束时间计算跨越的节次行，返回 (from, to, y1, y2)。
+
+        普通课程用“最近节次”上下取整，晚自习则要求方块真正包裹实际时长，
+        因此起止像素还会在首/末行内按分钟比例插值，看起来就是被向下拉长。
+        """
+        count = self.period_count or len(self.schedule)
+        start = time_to_minutes(course.get("start", ""))
+        end = time_to_minutes(course.get("end", ""))
+        if not count or start is None or end is None:
+            return None, None, 0, 0
+        if end <= start:
+            end = start + 1
+
+        def period_bounds(index):
+            period = self.schedule[index]
+            return time_to_minutes(period["start"]), time_to_minutes(period["end"])
+
+        def locate(minutes, boundary_end=False):
+            for index in range(count):
+                ps, pe = period_bounds(index)
+                if ps is None or pe is None:
+                    continue
+                if boundary_end:
+                    if ps < minutes <= pe:
+                        return index, ps, pe
+                elif ps <= minutes < pe:
+                    return index, ps, pe
+            return None, None, None
+
+        from_index, fs, fe = locate(start)
+        if from_index is None:
+            from_index = min(
+                range(count),
+                key=lambda i: abs(start - (period_bounds(i)[0] or start)))
+            fs, fe = period_bounds(from_index)
+        to_index, ts, te = locate(end, boundary_end=True)
+        if to_index is None:
+            to_index = min(
+                range(count),
+                key=lambda i: abs(end - (period_bounds(i)[1] or end)))
+            ts, te = period_bounds(to_index)
+        if to_index < from_index:
+            to_index = from_index
+            ts, te = period_bounds(to_index)
+        if fs is None or ts is None:
+            return None, None, 0, 0
+
+        span_start = max(1, (fe or fs) - fs)
+        span_end = max(1, (te or ts) - ts)
+        frac_start = min(1.0, max(0.0, (start - fs) / float(span_start)))
+        frac_end = min(1.0, max(0.0, (end - ts) / float(span_end)))
+        if to_index == from_index and frac_end <= frac_start:
+            frac_end = min(1.0, frac_start + 0.25)
+
+        y1 = from_index * self.ROW_HEIGHT + frac_start * self.ROW_HEIGHT + 3
+        y2 = to_index * self.ROW_HEIGHT + frac_end * self.ROW_HEIGHT - 3
+        if y2 - y1 < 28:
+            y2 = y1 + 28
+        return from_index + 1, to_index + 1, y1, y2
+
     def _draw(self):
         self.header.delete("all")
         self.canvas.delete("all")
@@ -1324,15 +1500,24 @@ class TimetableWindow:
             weekday = int(course.get("weekday", 0))
             if weekday not in by_day:
                 continue
-            period_from, period_to = resolve_course_periods(course)
-            if period_from is None or period_to is None:
-                continue
-            period_from = max(1, min(self.period_count, period_from))
-            period_to = max(period_from, min(self.period_count, period_to))
+            if course.get("is_evening_study"):
+                period_from, period_to, y1, y2 = self._evening_geometry(course)
+                if period_from is None or period_to is None:
+                    continue
+            else:
+                period_from, period_to = resolve_course_periods(course)
+                if period_from is None or period_to is None:
+                    continue
+                period_from = max(1, min(self.period_count, period_from))
+                period_to = max(period_from, min(self.period_count, period_to))
+                y1 = (period_from - 1) * self.ROW_HEIGHT + 3
+                y2 = period_to * self.ROW_HEIGHT - 3
             by_day[weekday].append({
                 "course": course,
                 "from": period_from,
                 "to": period_to,
+                "y1": y1,
+                "y2": y2,
             })
 
         for weekday, entries in by_day.items():
@@ -1346,8 +1531,8 @@ class TimetableWindow:
                     course = entry["course"]
                     x1 = base_x + entry["lane"] * lane_w + 3
                     x2 = base_x + (entry["lane"] + 1) * lane_w - 3
-                    y1 = (entry["from"] - 1) * self.ROW_HEIGHT + 3
-                    y2 = entry["to"] * self.ROW_HEIGHT - 3
+                    y1 = entry["y1"]
+                    y2 = entry["y2"]
                     width = max(24, x2 - x1)
                     height = max(24, y2 - y1)
                     self.canvas.create_rectangle(
@@ -1422,6 +1607,8 @@ class CourseDialog(tk.Toplevel):
         self.advance_var = tk.StringVar(value=str(course.get("advance", 10)))
         self.weeks_var = tk.StringVar(value=weeks_to_text(course.get("weeks", "all")))
         self.extra_enabled_var = tk.BooleanVar(value=bool(course.get("extra_enabled", False)))
+        self.evening_var = tk.BooleanVar(
+            value=bool(course.get("is_evening_study", False)))
         self.extra_count_var = tk.StringVar(value="1次")
         self.extra_rows = []
 
@@ -1475,6 +1662,14 @@ class CourseDialog(tk.Toplevel):
         self.period_to_box.pack(side="left", padx=(4, 8))
         ttk.Label(period_frame, text="时间变化会自动预填，可手动修改",
                   style="Hint.TLabel").pack(side="left", padx=(6, 0))
+
+        row += 1
+        ttk.Label(self, text="晚自习").grid(row=row, column=0, sticky="w", pady=4)
+        self.evening_check = ttk.Checkbutton(
+            self, text="是否为晚自习（课表按真实起止时间拉长方块）",
+            variable=self.evening_var,
+        )
+        self.evening_check.grid(row=row, column=1, columnspan=3, sticky="w", pady=4)
 
         row += 1
         ttk.Label(self, text="地点").grid(row=row, column=0, sticky="w", pady=4)
@@ -1727,6 +1922,7 @@ class CourseDialog(tk.Toplevel):
             "text": self.text_box.get("1.0", "end-1c").strip(),
             "period_from": period_from,
             "period_to": period_to,
+            "is_evening_study": bool(self.evening_var.get()),
             "extra_enabled": extra_enabled,
             "extra_count": len(extras) if extra_enabled else 0,
             "extras": extras,
@@ -1805,8 +2001,14 @@ class MakeupDialog(tk.Toplevel):
 # ---------------------------------------------------------------------------
 
 class CourseReminderApp:
-    def __init__(self, root):
+    def __init__(self, root, single_instance=None):
         self.root = root
+        self.single_instance = single_instance
+        self.hidden = False
+        self._wake_requested = False
+        self._wake_job = None
+        self._quitting = False
+        self._pending_status = None
         self.courses = []
         self.schedule = []
         self.term_start = None
@@ -1844,6 +2046,10 @@ class CourseReminderApp:
         self.root.after(300, self._ensure_holidays)
         self.root.after(300, self._poll_holiday_queue)
         self.root.after(2500, self._pet_watch)
+        # 单例唤醒：后台线程只写标志位，由主线程的轻量定时器 deiconify。
+        if self.single_instance is not None:
+            self.single_instance.start_watcher(self._request_wake)
+        self._wake_job = self.root.after(400, self._poll_wake)
 
     # ------------------------------ 界面 ------------------------------
 
@@ -1971,6 +2177,13 @@ class CourseReminderApp:
                   style="Hint.TLabel").grid(row=4, column=1, columnspan=3,
                                             sticky="w", padx=(10, 0))
 
+        ttk.Label(settings, text="点右上角 X 只是隐藏到后台，提醒继续运行",
+                  style="Hint.TLabel").grid(row=5, column=1, columnspan=2,
+                                            sticky="w", padx=(10, 0), pady=(8, 0))
+        self.quit_button = ttk.Button(settings, text="彻底退出程序",
+                                      command=self.quit_app)
+        self.quit_button.grid(row=5, column=3, sticky="e", pady=(8, 0))
+
         makeup_frame = ttk.LabelFrame(
             outer, text="补班映射（补班日按指定星期的课表提醒）", padding=8)
         makeup_frame.pack(fill="x", pady=(0, 8))
@@ -1999,7 +2212,7 @@ class CourseReminderApp:
         self.stop_button = ttk.Button(reminder_bar, text="停止提醒",
                                       command=self.stop_reminders, state="disabled")
         self.stop_button.pack(side="left", padx=(8, 0))
-        ttk.Label(reminder_bar, text="关闭主程序即停止提醒",
+        ttk.Label(reminder_bar, text="关闭窗口不会停止提醒",
                   style="Hint.TLabel").pack(side="right")
 
     def _on_course_wheel(self, event):
@@ -2089,6 +2302,8 @@ class CourseReminderApp:
             return False
 
     def _refresh_courses(self):
+        if self.hidden:
+            return
         self.courses = sort_courses(self.courses)
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -2119,6 +2334,8 @@ class CourseReminderApp:
                 self.timetable_window = None
 
     def _refresh_makeup(self):
+        if self.hidden:
+            return
         for item in self.makeup_tree.get_children():
             self.makeup_tree.delete(item)
         for entry in self.makeup:
@@ -2254,6 +2471,8 @@ class CourseReminderApp:
             self._set_status("学期开始日期已保存")
 
     def _update_week_label(self):
+        if self.hidden:
+            return
         if not self.term_start:
             self.week_var.set("未设置学期开始日期，生效周次将被忽略")
             return
@@ -2433,14 +2652,20 @@ class CourseReminderApp:
         return ready
 
     def _pet_watch(self):
+        if self.hidden:
+            # 后台隐身时不做任何界面刷新，只保留轻量检查。
+            self.root.after(2500, self._pet_watch)
+            return
         try:
             self._check_pet()
         except tk.TclError:
             return
         self.root.after(2500, self._pet_watch)
 
-    def start_reminders(self):
+    def start_reminders(self, silent=False):
         if not self._check_pet():
+            if silent:
+                return
             if not os.path.isfile(pet_path()):
                 message = "未找到 assets/pet.png 或 assets/default_pet.png，无法提醒"
             else:
@@ -2581,15 +2806,83 @@ class CourseReminderApp:
             window.close()
 
     def _set_status(self, text):
+        if self.hidden:
+            self._pending_status = text
+            return
         self.status_var.set(text)
 
-    def on_close(self):
-        self.reminding = False
-        if self.reminder_job:
+    # ------------------------------ 后台常驻 ------------------------------
+
+    def _request_wake(self):
+        """子线程调用：只置标志位，真正的 deiconify 交给主线程定时器。"""
+        self._wake_requested = True
+
+    def _poll_wake(self):
+        if self._quitting:
+            return
+        if self._wake_requested:
+            self._wake_requested = False
             try:
-                self.root.after_cancel(self.reminder_job)
+                self.show_window()
+            except tk.TclError:
+                return
+        self._wake_job = self.root.after(400, self._poll_wake)
+
+    def show_window(self):
+        """从后台恢复主界面（再次双击 exe 触发）。"""
+        if self._quitting:
+            return
+        was_hidden = self.hidden
+        self.hidden = False
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+        if was_hidden:
+            self._refresh_courses()
+            self._refresh_makeup()
+            self._update_week_label()
+            self._pending_status = None
+            self._set_status("已从后台回到前台，提醒继续运行")
+
+    def hide_to_background(self):
+        """点右上角 X：隐藏主窗口，任务栏不留图标，定时器继续跑以准时提醒。"""
+        if self._quitting or self.hidden:
+            return
+        # 隐藏前确保提醒已启动，否则后台常驻形同虚设。
+        if not self.reminding:
+            try:
+                self.start_reminders(silent=True)
             except tk.TclError:
                 pass
+        if self.timetable_window is not None:
+            try:
+                self.timetable_window.close()
+            except tk.TclError:
+                pass
+            self.timetable_window = None
+        self.hidden = True
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            pass
+
+    def quit_app(self):
+        """彻底退出：取消所有定时器、关闭提醒窗口并结束进程。"""
+        if self._quitting:
+            return
+        self._quitting = True
+        self.reminding = False
+        for job in (self.reminder_job, self._wake_job):
+            if job:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+        self.reminder_job = None
+        self._wake_job = None
         self._close_all_reminders()
         if self.timetable_window is not None:
             try:
@@ -2597,17 +2890,32 @@ class CourseReminderApp:
             except tk.TclError:
                 pass
             self.timetable_window = None
+        if self.single_instance is not None:
+            self.single_instance.close()
         try:
             self.root.destroy()
         except tk.TclError:
             pass
+        os._exit(0)
+
+    def on_close(self):
+        self.hide_to_background()
 
 
 def main():
     enable_dpi_awareness()
+    instance = SingleInstance()
+    if instance.already_running:
+        # 已经有实例在后台：通知旧实例显示窗口，本进程立即退出。
+        instance.signal_existing()
+        instance.close()
+        return
     root = tk.Tk()
-    CourseReminderApp(root)
-    root.mainloop()
+    app = CourseReminderApp(root, instance)
+    try:
+        root.mainloop()
+    finally:
+        instance.close()
 
 
 if __name__ == "__main__":

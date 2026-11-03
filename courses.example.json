@@ -12,6 +12,7 @@
       "text": "",
       "period_from": null,
       "period_to": null,
+      "is_evening_study": false,
       "extra_enabled": true,
       "extra_count": 1,
       "extras": [
