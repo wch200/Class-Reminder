@@ -19,6 +19,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import urllib.request
+import winreg
 from tkinter import messagebox, ttk
 
 try:
@@ -30,12 +31,24 @@ except Exception:
     PIL_AVAILABLE = False
 
 APP_TITLE = "课程提醒"
+# 桌宠出厂默认值：旧版写死的 300 像素上限，以及右下角 24 像素边距。
+DEFAULT_SIZE = 300
+DEFAULT_X = 24
+DEFAULT_Y = 24
+PET_MIN_SIZE = 150
+PET_MAX_SIZE = 600
+# 预览区背景图候选：同一目录下按此顺序查找，png 优先，其次 jpg / jpeg。
+PREVIEW_BG_NAMES = ("win11_bg.png", "win11_bg.jpg", "win11_bg.jpeg")
 DEFAULT_TEMPLATE = "到时间了，现在应该去上{课程名}课"
 DEFAULT_EXTRA_TEMPLATE = "还有 {minutes} 分钟就要去上 {课程名} 课了"
 TRANSPARENT_KEY = "#010203"
 HOLIDAY_URL = "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{year}.json"
 HOLIDAY_MIRROR = "https://fastly.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json"
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+# 开机自启写在当前用户的 Run 键下，不需要管理员权限。
+AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "ClassReminder"
 
 # 作息表由用户通过“设置每日作息”自行配置，程序不再写死节次。
 # PERIODS / PERIOD_LABELS 在载入 schedule.json 后动态生成。
@@ -82,6 +95,60 @@ def pet_path():
             if os.path.isfile(candidate):
                 return candidate
     return os.path.join(app_dir(), "assets", "pet.png")
+
+
+def preview_bg_path():
+    """桌宠设置预览区的背景图：previews 目录下自动识别 png/jpg/jpeg。
+
+    找不到任何一张时返回 None，由调用方回落到纯色背景（绝不读取系统壁纸）。
+    """
+    roots = [app_dir()]
+    mei = getattr(sys, "_MEIPASS", None)
+    if mei:
+        roots.append(mei)
+    for filename in PREVIEW_BG_NAMES:
+        for root in roots:
+            candidate = os.path.join(root, "previews", filename)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def autostart_command():
+    """开机自启命令：程序绝对路径 + --silent，登录后静默挂后台。"""
+    exe = os.path.abspath(sys.executable)
+    if getattr(sys, "frozen", False):
+        return '"%s" --silent' % exe
+    # 开发环境：解释器 + 脚本路径，保证命令行也能直接运行。
+    return '"%s" "%s" --silent' % (exe, os.path.abspath(__file__))
+
+
+def autostart_enabled():
+    """读取 HKCU Run 中是否存在 ClassReminder 键值。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, AUTOSTART_NAME)
+        return bool(str(value).strip())
+    except OSError:
+        return False
+
+
+def set_autostart(enabled):
+    """勾选时写入注册表，取消时删除键值；成功返回 True。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY,
+                            0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ,
+                                  autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        return False
 
 
 def load_json(path, default):
@@ -745,8 +812,9 @@ class ReminderWindow:
             raise RuntimeError("未找到 assets/pet.png 或 assets/default_pet.png")
         image = Image.open(path).convert("RGBA")
         original_w, original_h = image.size
-        max_edge = 300
-        if original_w > max_edge or original_h > max_edge:
+        max_edge = self.app.pet_size()
+        # 滑块允许放大也允许缩小，始终把最长边缩放到当前设定值。
+        if max(original_w, original_h) != max_edge:
             scale = max_edge / float(max(original_w, original_h))
             new_w = max(1, int(round(original_w * scale)))
             new_h = max(1, int(round(original_h * scale)))
@@ -876,17 +944,75 @@ class ReminderWindow:
                                 fill="#1f2937", outline="")
 
     def _bind_events(self):
-        self.top.bind("<Button-1>", lambda _event: self.close())
-        self.canvas.bind("<Button-1>", lambda _event: self.close())
+        # 拖拽桌宠可移动位置并记忆；轻点则关闭提醒。
+        self.top.bind("<ButtonPress-1>", self._on_press)
+        self.top.bind("<B1-Motion>", self._on_drag)
+        self.top.bind("<ButtonRelease-1>", self._on_release)
         self.top.bind("<Escape>", lambda _event: self.close())
+
+    def _on_press(self, event):
+        # 按住就先停掉入场的滑动/漂浮动画，拖拽位置才不会被动画覆盖。
+        self._cancel_job("anim_job")
+        self._press_root = (event.x_root, event.y_root)
+        self._drag_origin = (self.top.winfo_x(), self.top.winfo_y())
+        self._dragging = True
+        self._drag_moved = False
+        self._drag_pos = self._drag_origin
+
+    def _on_drag(self, event):
+        if not getattr(self, "_dragging", False):
+            return
+        dx = event.x_root - self._press_root[0]
+        dy = event.y_root - self._press_root[1]
+        if abs(dx) > 3 or abs(dy) > 3:
+            self._drag_moved = True
+        # 拖动时停止漂浮动画，避免动画和几何位置互相打架。
+        self._cancel_job("anim_job")
+        screen_w = self.top.winfo_screenwidth()
+        screen_h = self.top.winfo_screenheight()
+        x = max(0, min(screen_w - self.width, self._drag_origin[0] + dx))
+        y = max(0, min(screen_h - self.height, self._drag_origin[1] + dy))
+        try:
+            self.top.geometry("+%d+%d" % (x, y))
+        except tk.TclError:
+            return
+        self._drag_pos = (x, y)
+        self.target_x, self.base_y = x, y
+
+    def _on_release(self, _event):
+        if not getattr(self, "_dragging", False):
+            return
+        self._dragging = False
+        if not self._drag_moved:
+            self.close()
+            return
+        # 松手后把位置写回 config.json，下次提醒仍出现在这个位置。
+        try:
+            # 用拖动过程中算好的坐标，避免 winfo_x 尚未刷新导致存旧值。
+            x, y = getattr(self, "_drag_pos", None) or (
+                self.top.winfo_x(), self.top.winfo_y())
+            self.app.remember_pet_position(x, y, self.width, self.height)
+            self.target_x, self.base_y = x, y
+            # 拖动时停掉了浮动动画，松手后必须用新坐标重新起浮：
+            # 把入场滑动起点对齐到当前位置，并让相位从 0 开始。
+            self.start_x = x
+            self.birth = time.time() - 0.6
+            self._cancel_job("anim_job")
+            self._animate()
+        except tk.TclError:
+            pass
 
     def _place_window(self, index):
         screen_w = self.top.winfo_screenwidth()
         screen_h = self.top.winfo_screenheight()
-        self.target_x = max(8, screen_w - self.width - 24)
-        lowest = max(8, screen_h - self.height - 24)
-        stacked = screen_h - self.height - 56 - index * (self.height + 10)
-        self.base_y = max(8, min(lowest, stacked))
+        mx, my = self.app.pet_margins()
+        # 记忆的是“距右侧 / 距底部”的边距，换分辨率也不会跑到屏幕外。
+        self.target_x = max(8, min(screen_w - self.width - 8,
+                                   screen_w - self.width - mx))
+        base = screen_h - self.height - my
+        if index > 0:
+            base -= index * (self.height + 10)
+        self.base_y = max(8, min(screen_h - self.height - 8, base))
         self.top.geometry("%dx%d+%d+%d" % (
             self.width, self.height, screen_w + 8, self.base_y))
 
@@ -2027,6 +2153,21 @@ class CourseReminderApp:
         self.last_week_day = None
         self.pet_missing = None
         self.holiday_queue = queue.Queue()
+        # 启动即读取注册表，勾选状态与系统实际配置保持一致。
+        self.autostart_var = tk.BooleanVar(value=autostart_enabled())
+        self._pet_save_job = None
+        self._pet_source_image = None
+        self._pet_preview_photo = None
+        self._preview_fonts = {}
+        self._preview_redraw_job = None
+        self._preview_last = None
+        self._preview_bg_photo = None
+        self._preview_bg_key = None
+        self._preview_bg_name = None
+        self._preview_bg_frame = None
+        self._preview_bg_draw_rect = None
+        self._clock_job = None
+        self._clock_family = None
 
         self.root.title(APP_TITLE)
         self.root.geometry("1040x850")
@@ -2097,7 +2238,16 @@ class CourseReminderApp:
         self.pet_state = ttk.Label(head, text="", style="Hint.TLabel")
         self.pet_state.pack(side="right")
 
-        courses_frame = ttk.LabelFrame(outer, text="课程表", padding=8)
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill="both", expand=True, pady=(8, 0))
+        body = ttk.Frame(notebook, padding=(0, 8, 0, 0))
+        pet_tab = ttk.Frame(notebook, padding=(0, 8, 0, 0))
+        notebook.add(body, text="课程与提醒")
+        notebook.add(pet_tab, text="桌宠设置")
+        self.notebook = notebook
+        self.pet_tab = pet_tab
+
+        courses_frame = ttk.LabelFrame(body, text="课程表", padding=8)
         courses_frame.pack(fill="both", expand=True, pady=(10, 8))
         toolbar = ttk.Frame(courses_frame)
         toolbar.pack(fill="x", pady=(0, 6))
@@ -2143,7 +2293,7 @@ class CourseReminderApp:
         self.tree.bind("<Button-4>", lambda _event: self.tree.yview_scroll(-1, "units"))
         self.tree.bind("<Button-5>", lambda _event: self.tree.yview_scroll(1, "units"))
 
-        settings = ttk.LabelFrame(outer, text="设置", padding=10)
+        settings = ttk.LabelFrame(body, text="设置", padding=10)
         settings.pack(fill="x", pady=(0, 8))
         settings.columnconfigure(1, weight=1)
 
@@ -2184,8 +2334,14 @@ class CourseReminderApp:
                                       command=self.quit_app)
         self.quit_button.grid(row=5, column=3, sticky="e", pady=(8, 0))
 
+        self.autostart_check = ttk.Checkbutton(
+            settings, text="随 Windows 开机自动启动（静默挂后台）",
+            variable=self.autostart_var, command=self._toggle_autostart)
+        self.autostart_check.grid(row=6, column=0, columnspan=3,
+                                  sticky="w", pady=(10, 0))
+
         makeup_frame = ttk.LabelFrame(
-            outer, text="补班映射（补班日按指定星期的课表提醒）", padding=8)
+            body, text="补班映射（补班日按指定星期的课表提醒）", padding=8)
         makeup_frame.pack(fill="x", pady=(0, 8))
         makeup_bar = ttk.Frame(makeup_frame)
         makeup_bar.pack(fill="x", pady=(0, 6))
@@ -2204,7 +2360,7 @@ class CourseReminderApp:
         self.makeup_tree.column("follow", width=180, anchor="center", stretch=False)
         self.makeup_tree.pack(fill="x")
 
-        reminder_bar = ttk.Frame(outer)
+        reminder_bar = ttk.Frame(body)
         reminder_bar.pack(fill="x", pady=(2, 0))
         self.start_button = ttk.Button(reminder_bar, text="启动提醒",
                                        command=self.start_reminders)
@@ -2215,12 +2371,711 @@ class CourseReminderApp:
         ttk.Label(reminder_bar, text="关闭窗口不会停止提醒",
                   style="Hint.TLabel").pack(side="right")
 
+        self._build_pet_tab(pet_tab)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, _event=None):
+        """每次切换标签页都重新读取 previews 背景图，绝不沿用旧缓存。"""
+        self._preview_bg_photo = None
+        self._preview_bg_key = None
+        self._preview_bg_name = None
+        self._preview_bg_frame = None
+        self._preview_bg_draw_rect = None
+        self._redraw_pet_preview()
+
     def _on_course_wheel(self, event):
         """课程列表的滚轮滚动：每格 120 单位折合一行。"""
         delta = int(-1 * (event.delta / 120)) if event.delta else 0
         if delta:
             self.tree.yview_scroll(delta, "units")
         return "break"
+
+    # ------------------------------ 桌宠设置 ------------------------------
+
+    def pet_size(self):
+        """当前桌宠最长边像素，读不到或越界时回落到出厂默认值。"""
+        try:
+            size = int(self.config.get("pet_size", DEFAULT_SIZE))
+        except (TypeError, ValueError):
+            size = DEFAULT_SIZE
+        return max(PET_MIN_SIZE, min(PET_MAX_SIZE, size))
+
+    def pet_margins(self):
+        """桌宠位置以“距右侧 / 距底部”的边距保存，换分辨率也不会跑出屏幕。"""
+        try:
+            mx = int(self.config.get("pet_x", DEFAULT_X))
+            my = int(self.config.get("pet_y", DEFAULT_Y))
+        except (TypeError, ValueError):
+            mx, my = DEFAULT_X, DEFAULT_Y
+        return max(0, mx), max(0, my)
+
+    def set_pet_size(self, size, save=True):
+        try:
+            size = int(round(float(size)))
+        except (TypeError, ValueError):
+            size = DEFAULT_SIZE
+        size = max(PET_MIN_SIZE, min(PET_MAX_SIZE, size))
+        self.config["pet_size"] = size
+        if save:
+            self._save_config_now()
+        return size
+
+    def remember_pet_position(self, x, y, width, height):
+        """桌宠拖拽松手后调用：把绝对坐标换算成右下角边距并保存。"""
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        self.config["pet_x"] = max(0, screen_w - int(x) - int(width))
+        self.config["pet_y"] = max(0, screen_h - int(y) - int(height))
+        self._save_config_now()
+
+    def _save_config_now(self):
+        self._pet_save_job = None
+        try:
+            save_json(CONFIG_PATH, self.config)
+        except OSError:
+            pass
+
+    def _schedule_pet_save(self):
+        """滑块拖动很密集，稍作延迟再落盘，避免频繁写文件。"""
+        if self._pet_save_job:
+            try:
+                self.root.after_cancel(self._pet_save_job)
+            except tk.TclError:
+                pass
+        self._pet_save_job = self.root.after(350, self._save_config_now)
+
+    def _build_pet_tab(self, parent):
+        preview_box = ttk.LabelFrame(parent, text="效果图预览（模拟屏幕）", padding=8)
+        preview_box.pack(fill="x")
+
+        # 预览区固定 16:9：缩放因子只取“预览区宽度 / 真实屏幕宽度”，
+        # 桌宠与气泡按该因子等比绘制，占屏比例与真实桌面一致。
+        screen_h = max(1, self.root.winfo_screenheight())
+        budget_h = min(620, int(screen_h * 0.33))
+        budget_h = max(240, budget_h)
+        canvas_w = min(1000, int(round(budget_h * 16.0 / 9.0)))
+        canvas_w = max(320, canvas_w)
+        canvas_h = max(180, int(round(canvas_w * 9.0 / 16.0)))
+
+        self.pet_preview_info = ttk.Label(
+            preview_box, text="", style="Hint.TLabel", anchor="center")
+        self.pet_preview_info.pack(fill="x", pady=(0, 4))
+        self.pet_preview = tk.Canvas(
+            preview_box, width=canvas_w, height=canvas_h, bg="#e8eef6",
+            highlightthickness=0, bd=0,
+        )
+        self.pet_preview.pack(anchor="center")
+        # 窗口缩放 / DPI 变化时 Canvas 实际宽度会变，重算缩放因子。
+        self.pet_preview.bind("<Configure>", self._schedule_preview_redraw)
+
+        size_box = ttk.LabelFrame(parent, text="桌宠大小", padding=10)
+        size_box.pack(fill="x", pady=(10, 0))
+        self.pet_size_var = tk.DoubleVar(value=self.pet_size())
+        self.pet_size_label = ttk.Label(size_box, text="%d px" % self.pet_size())
+        self.pet_size_label.pack(side="right")
+        ttk.Scale(
+            size_box, from_=PET_MIN_SIZE, to=PET_MAX_SIZE, orient="horizontal",
+            variable=self.pet_size_var, command=self._on_pet_size_slide,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 12))
+        ttk.Label(parent, text="范围 %d - %d px，拖动时效果图实时缩放并保存到 config.json"
+                  % (PET_MIN_SIZE, PET_MAX_SIZE),
+                  style="Hint.TLabel").pack(anchor="w", pady=(6, 0))
+
+        reset_box = ttk.LabelFrame(parent, text="恢复出厂设置", padding=10)
+        reset_box.pack(fill="x", pady=(10, 0))
+        ttk.Button(reset_box, text="重置大小",
+                   command=self.reset_pet_size).pack(side="left")
+        ttk.Button(reset_box, text="重置位置",
+                   command=self.reset_pet_position).pack(side="left", padx=(10, 0))
+        ttk.Button(reset_box, text="一键重置",
+                   command=self.reset_pet_all).pack(side="left", padx=(10, 0))
+        ttk.Label(reset_box,
+                  text="出厂默认：%d px，右下角 %d px 边距" % (DEFAULT_SIZE, DEFAULT_X),
+                  style="Hint.TLabel").pack(side="right")
+
+        ttk.Label(parent,
+                  text="提示：提醒弹出时按住桌宠即可拖动，松手后位置自动记忆。",
+                  style="Hint.TLabel").pack(anchor="w", pady=(10, 0))
+        self._redraw_pet_preview()
+
+    def _preview_font(self, size, bold=False):
+        """预览用的测量字体：按实际字号缓存，避免每次重绘都新建 Tk 字体。"""
+        key = (int(size), bool(bold))
+        font = self._preview_fonts.get(key)
+        if font is None:
+            font = tkfont.Font(root=self.root, family="Microsoft YaHei UI",
+                               size=int(size),
+                               weight="bold" if bold else "normal")
+            self._preview_fonts[key] = font
+        return font
+
+    def _preview_pet_source(self):
+        if not PIL_AVAILABLE:
+            return None
+        if self._pet_source_image is None:
+            path = pet_path()
+            if not os.path.isfile(path):
+                return None
+            self._pet_source_image = Image.open(path).convert("RGBA")
+        return self._pet_source_image
+
+    def _preview_pet_photo_px(self, width, height):
+        """按“精确像素”缩放桌宠，保证预览里的长宽比例与真实弹窗一致。"""
+        try:
+            source = self._preview_pet_source()
+            if source is None:
+                return None
+            resized = source.resize(
+                (max(1, int(round(width))), max(1, int(round(height)))),
+                getattr(Image, "Resampling", Image).LANCZOS,
+            )
+            return ImageTk.PhotoImage(resized, master=self.root)
+        except Exception:
+            return None
+
+    def _preview_real_layout(self, size):
+        """完全复刻 ReminderWindow._build_canvas 的尺寸公式（单位：屏幕像素）。
+
+        预览只是把这套真实尺寸整体乘以缩放因子，因此比例与真机弹窗一致。
+        """
+        screen_w = max(1, self.root.winfo_screenwidth())
+        screen_h = max(1, self.root.winfo_screenheight())
+
+        source = self._preview_pet_source()
+        if source is not None:
+            src_w, src_h = source.size
+        else:
+            src_w = src_h = 1
+        # 与 ReminderWindow._load_pet 一致：最长边缩放到 size，另一边按比例。
+        if src_w >= src_h:
+            pet_w = max(1, int(size))
+            pet_h = max(1, int(round(pet_w * src_h / float(src_w))))
+        else:
+            pet_h = max(1, int(size))
+            pet_w = max(1, int(round(pet_h * src_w / float(src_h))))
+
+        clock_size = 58
+        fixed_width = 12 + pet_w + 16 + 14 + clock_size + 12 + 24
+        available_bubble = max(180, screen_w - fixed_width)
+        max_bubble_w = min(BUBBLE_MAX_WIDTH, available_bubble)
+
+        title_text = render_text(
+            self.config.get("default_template") or DEFAULT_TEMPLATE,
+            {"name": "高等数学"}).strip() or DEFAULT_TEMPLATE
+        sub_text = "还有 5 分钟 · 高等数学"
+        max_text_w = max(120, max_bubble_w - 36)
+        lines = [title_text]
+        sub_lines = [sub_text]
+        bubble_w = min(220, max_bubble_w)
+        bubble_h = 104
+        title_font = self._preview_font(13, bold=True)
+        sub_font = self._preview_font(9)
+        for font_size in (13, 12, 11, 10, 9, 8):
+            title_font = self._preview_font(font_size, bold=True)
+            sub_font = self._preview_font(max(8, font_size - 4))
+            lines = wrap_text(title_text, title_font, max_text_w)
+            sub_lines = wrap_text(sub_text, sub_font, max_text_w)
+            text_w = min(max_text_w, max([title_font.measure(line) for line in lines] or [1]))
+            sub_w = max([sub_font.measure(line) for line in sub_lines] or [0])
+            bubble_w = max(180, min(max_bubble_w, max(text_w, sub_w) + 36))
+            title_h = len(lines) * title_font.metrics("linespace")
+            sub_h = len(sub_lines) * sub_font.metrics("linespace")
+            bubble_h = max(104, 20 + title_h + 8 + sub_h + 18)
+            if bubble_h <= screen_h - 140 or font_size == 8:
+                break
+        if bubble_h > screen_h - 120:
+            bubble_h = max(120, screen_h - 120)
+
+        width = 12 + pet_w + 16 + bubble_w + 14 + clock_size + 12
+        height = max(pet_h + 24, bubble_h + 24, clock_size + 24)
+        return {
+            "pet_w": pet_w, "pet_h": pet_h,
+            "bubble_w": bubble_w, "bubble_h": bubble_h,
+            "clock_size": clock_size, "width": width, "height": height,
+            "title_font": title_font, "sub_font": sub_font,
+            "lines": lines, "sub_lines": sub_lines,
+        }
+
+    def _preview_pixel_font(self, px, bold=False):
+        key = ("px", int(px), bool(bold))
+        font = self._preview_fonts.get(key)
+        if font is None:
+            font = tkfont.Font(root=self.root, family="Microsoft YaHei UI",
+                               size=-max(1, int(px)),
+                               weight="bold" if bold else "normal")
+            self._preview_fonts[key] = font
+        return font
+
+    def _fit_pixel_font(self, px, bold, lines, max_width):
+        """在极小字号下逐像素收缩，保证文字实测宽度不超过气泡内宽。"""
+        px = max(1, int(px))
+        while px > 1:
+            font = self._preview_pixel_font(px, bold)
+            widest = max([font.measure(line) for line in lines] or [0])
+            if widest <= max_width:
+                return px, font
+            px -= 1
+        return 1, self._preview_pixel_font(1, bold)
+
+    def _preview_background_photo(self, width, height, force_reload=False):
+        """previews 下的背景图等比例完整显示（contain），不裁掉任何内容。
+
+        缩放后不足的部分用黑边补齐，因此带任务栏的整张壁纸都会完整留在
+        Canvas 里；返回 None 表示没有背景图，调用方使用纯色默认背景。
+        """
+        if not PIL_AVAILABLE or width <= 1 or height <= 1:
+            return None
+        path = preview_bg_path()
+        if not path:
+            self._preview_bg_photo = None
+            self._preview_bg_key = None
+            self._preview_bg_name = None
+            self._preview_bg_frame = None
+            self._preview_bg_draw_rect = None
+            return None
+        try:
+            key = (path, os.path.getmtime(path), os.path.getsize(path),
+                   int(width), int(height))
+            if (not force_reload and key == self._preview_bg_key
+                    and self._preview_bg_photo is not None):
+                return self._preview_bg_photo
+            with Image.open(path) as raw:
+                image = raw.convert("RGB")
+            src_w, src_h = image.size
+            if src_w <= 0 or src_h <= 0:
+                return None
+            # cover：等比放大到刚好铺满整个 Canvas，优先保留底部任务栏，
+            # 多出来的部分从顶部裁掉（左右居中裁），不再留黑边。
+            scale = max(width / float(src_w), height / float(src_h))
+            new_w = max(1, int(round(src_w * scale)))
+            new_h = max(1, int(round(src_h * scale)))
+            image = image.resize((new_w, new_h),
+                                 getattr(Image, "Resampling", Image).LANCZOS)
+            left = max(0, (new_w - int(width)) // 2)
+            top = max(0, new_h - int(height))
+            frame = image.crop((left, top, left + int(width), top + int(height)))
+            photo = ImageTk.PhotoImage(frame, master=self.root)
+            self._preview_bg_photo = photo
+            self._preview_bg_key = key
+            self._preview_bg_name = os.path.basename(path)
+            self._preview_bg_frame = frame
+            self._preview_bg_draw_rect = (0, 0, int(width), int(height))
+            return photo
+        except Exception:
+            self._preview_bg_photo = None
+            self._preview_bg_key = None
+            self._preview_bg_name = None
+            self._preview_bg_frame = None
+            self._preview_bg_draw_rect = None
+            return None
+
+    # ---------------------- 预览区任务栏时钟 ----------------------
+
+    def _clock_font_family(self):
+        """优先使用 Windows 默认无衬线中文字体。"""
+        cached = getattr(self, "_clock_family", None)
+        if cached:
+            return cached
+        try:
+            families = set(tkfont.families(self.root))
+        except tk.TclError:
+            families = set()
+        for name in ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI",
+                     "Microsoft JhengHei UI", "Arial"):
+            if name in families:
+                self._clock_family = name
+                return name
+        self._clock_family = "TkDefaultFont"
+        return self._clock_family
+
+    def _clock_texts(self):
+        now = dt.datetime.now()
+        return now.strftime("%H:%M"), "%d/%d/%d" % (now.year, now.month, now.day)
+
+    def _taskbar_top(self):
+        """从背景图底部向上找任务栏的上边缘（返回 Canvas 坐标 y）。"""
+        frame = getattr(self, "_preview_bg_frame", None)
+        if frame is None:
+            return None
+        width, height = frame.size
+        if width <= 2 or height <= 2:
+            return None
+        step_x = max(1, width // 120)
+        columns = list(range(0, width, step_x))
+        bottom = {}
+        for x in columns:
+            try:
+                bottom[x] = frame.getpixel((x, height - 1))
+            except Exception:
+                return None
+        limit = int(height * 0.80)
+        for y in range(height - 1, limit, -1):
+            matched = 0
+            total = 0
+            for x in columns:
+                try:
+                    pixel = frame.getpixel((x, y))
+                except Exception:
+                    continue
+                base = bottom[x]
+                total += 1
+                if (abs(pixel[0] - base[0]) + abs(pixel[1] - base[1])
+                        + abs(pixel[2] - base[2])) <= 60:
+                    matched += 1
+            if total and matched / float(total) < 0.55:
+                return y + 1
+        return limit
+
+    def _taskbar_base_color(self, y1, y2):
+        """任务栏底色：对整条任务栏取中位数，图标只占少数，不影响结果。"""
+        frame = self._preview_bg_frame
+        width, height = frame.size
+        step_x = max(1, width // 80)
+        rows = list(range(int(y1) + 1, max(int(y1) + 2, int(y2)), 3))
+        samples = []
+        for x in range(0, width, step_x):
+            for y in rows:
+                try:
+                    samples.append(frame.getpixel((x, y)))
+                except Exception:
+                    continue
+        if not samples:
+            return (32, 66, 100)
+        count = len(samples)
+        return tuple(sorted(pixel[i] for pixel in samples)[count // 2]
+                     for i in range(3))
+
+    def _taskbar_tray_left(self, base, y1, y2):
+        """从右往左扫任务栏，定位托盘区最左边（时钟+网络/音量/电池等图标）。"""
+        frame = self._preview_bg_frame
+        width, height = frame.size
+        rows = list(range(int(y1) + 1, max(int(y1) + 2, int(y2)), 2))
+        if not rows:
+            return None
+        step_x = max(1, width // 500)
+
+        def active(x):
+            hits = 0
+            total = 0
+            for y in rows:
+                try:
+                    pixel = frame.getpixel((x, y))
+                except Exception:
+                    continue
+                total += 1
+                if (abs(pixel[0] - base[0]) + abs(pixel[1] - base[1])
+                        + abs(pixel[2] - base[2])) > 45:
+                    hits += 1
+            return total > 0 and hits / float(total) > 0.18
+
+        gap = 0
+        seen_active = False
+        limit = int(width * 0.60)
+        x = width - 1
+        while x > limit:
+            if active(x):
+                seen_active = True
+                gap = 0
+            else:
+                gap += step_x
+                if seen_active and gap >= 48:
+                    # 托盘已经结束（图标之间的小空档不算），再往左是任务栏空白区。
+                    return x + gap
+            x -= step_x
+        return None
+
+    def _taskbar_clock_box(self):
+        """时钟遮罩：覆盖托盘图标 + 时钟，高度严格在任务栏内部。"""
+        frame = getattr(self, "_preview_bg_frame", None)
+        if frame is None:
+            return None
+        width, height = frame.size
+        top = self._taskbar_top()
+        if top is None or top >= height - 2:
+            return None
+        taskbar_h = height - top
+        # 没有识别出任务栏（或底边是一大块纯色壁纸）时不画遮罩，免得糊一块色块。
+        if taskbar_h > height * 0.22:
+            return None
+        # 上边从任务栏上边缘内缩 1 px，下边一直贴到画布底边（即任务栏底边）。
+        y1 = float(top + 1)
+        y2 = float(height)
+        box_h = max(4.0, y2 - y1)
+        x2 = float(width)
+        # 默认只盖时钟；识别到托盘图标时向左扩展，把网络/音量/电池一起盖掉，
+        # 但不越过任务栏中间的应用图标区（最多占到画布 62% 处）。
+        box_w = min(width * 0.16, max(box_h * 3.4, 64.0))
+        x1 = x2 - box_w
+        tray_left = self._taskbar_tray_left(self._taskbar_base_color(y1, y2),
+                                           y1, y2)
+        if tray_left is not None:
+            # 再向左多留 34 px：既避免图标边缘残留半截，也盖掉托盘左侧的
+            # “显示隐藏图标”箭头 ^。
+            x1 = min(x1, float(tray_left) - 34.0)
+        x1 = max(x1, width * 0.62)
+        x1 = min(x1, x2 - 24.0)
+        return (x1, y1, x2, y2)
+
+    def _clock_background_color(self, box):
+        """取任务栏里（时钟左侧）纯色区域的颜色作为遮罩底色。"""
+        frame = getattr(self, "_preview_bg_frame", None)
+        if frame is None:
+            return "#1f3b57"
+        x1, y1, x2, y2 = box
+        xs = range(int(max(0, x1 - 26)), int(max(1, x1 - 8)))
+        ys = range(int(y1 + 2), int(max(y1 + 3, y2 - 1)), 2)
+        samples = []
+        for x in xs:
+            for y in ys:
+                try:
+                    samples.append(frame.getpixel((int(x), int(y))))
+                except Exception:
+                    continue
+        if not samples:
+            samples = [frame.getpixel((int(x2 - 4), int(y1 + 2)))]
+        count = len(samples)
+        channels = [sorted(pixel[i] for pixel in samples)[count // 2]
+                    for i in range(3)]
+        return "#%02x%02x%02x" % tuple(channels)
+
+    def _draw_taskbar_clock(self, canvas, width, height):
+        """在任务栏右下角画两行黑色时间：HH:MM + YYYY/M/D，整体靠右。"""
+        canvas.delete("taskbar_clock")
+        box = self._taskbar_clock_box()
+        if box is None:
+            return
+        x1, y1, x2, y2 = box
+        canvas.create_rectangle(x1, y1, x2, y2,
+                                fill=self._clock_background_color(box),
+                                outline="", tags="taskbar_clock")
+        time_text, date_text = self._clock_texts()
+        right_x = width - 15
+        inner_w = max(6.0, right_x - x1 - 2)
+        inner_h = max(6.0, (y2 - y1) - 2)
+        # 粗体、日期略大，保证小字号下依然清晰。
+        time_px, date_px = 1, 1
+        for candidate in range(max(1, int(inner_h)), 0, -1):
+            small = max(1, int(round(candidate * 0.86)))
+            big_font = self._preview_pixel_font(candidate, True)
+            small_font = self._preview_pixel_font(small, True)
+            total_h = (big_font.metrics("linespace")
+                       + small_font.metrics("linespace"))
+            if total_h > inner_h:
+                continue
+            if big_font.measure(time_text) > inner_w:
+                continue
+            if small_font.measure(date_text) > inner_w:
+                continue
+            time_px, date_px = candidate, small
+            break
+        time_font = self._preview_pixel_font(time_px, True)
+        date_font = self._preview_pixel_font(date_px, True)
+        canvas.create_text(right_x, y1 + (y2 - y1) * 0.32, text=time_text,
+                           anchor="e", fill="#000000", font=time_font,
+                           tags="taskbar_clock")
+        canvas.create_text(right_x, y1 + (y2 - y1) * 0.74, text=date_text,
+                           anchor="e", fill="#000000", font=date_font,
+                           tags="taskbar_clock")
+
+    def _tick_clock(self):
+        """每分钟刷新一次预览里的时间。"""
+        self._clock_job = None
+        try:
+            if not self.root.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._redraw_pet_preview()
+        if self._clock_job is None:
+            self._clock_job = self.root.after(60000, self._tick_clock)
+
+    def _redraw_pet_preview(self):
+        canvas = getattr(self, "pet_preview", None)
+        if canvas is None:
+            return
+        self._preview_redraw_job = None
+
+        screen_w = max(1, self.root.winfo_screenwidth())
+        screen_h = max(1, self.root.winfo_screenheight())
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width <= 1:
+            width = int(canvas.cget("width"))
+        if height <= 1:
+            height = int(canvas.cget("height"))
+        width = max(1, width)
+        height = max(1, height)
+
+        # 缩放因子 = 预览区宽度 / 真实屏幕宽度；Canvas 固定 16:9，
+        # 桌宠/气泡一律乘以该因子绘制，保证占屏比例与真实桌面一致。
+        scale = width / float(screen_w)
+        size = self.pet_size()
+
+        canvas.delete("all")
+        background = self._preview_background_photo(width, height)
+        if background is not None:
+            canvas.create_image(0, 0, image=background, anchor="nw")
+        else:
+            # 没有背景图时用最开始的纯色默认背景，绝不读取系统壁纸。
+            canvas.create_rectangle(0, 0, width, height,
+                                    fill="#e3ebf5", outline="#c3cfdd")
+        # 背景图铺好后，先在右下角盖掉旧时间并绘制当前系统时间。
+        self._draw_taskbar_clock(canvas, width, height)
+        if self._clock_job is None:
+            self._clock_job = self.root.after(60000, self._tick_clock)
+
+        layout = self._preview_real_layout(size)
+        margin_x, margin_y = self.pet_margins()
+
+        real_w, real_h = layout["width"], layout["height"]
+        win_w, win_h = real_w * scale, real_h * scale
+        # 与真机“距右侧 / 距底部”的边距一致，贴住预览区的右下角。
+        x = width - win_w - margin_x * scale
+        y = height - win_h - margin_y * scale
+        x = max(0.0, min(width - win_w, x))
+        y = max(0.0, min(height - win_h, y))
+
+        # 真机弹窗是透明底（只显示桌宠、气泡和时钟），这里也不画窗口底色，
+        # 只用极淡的投影勾出“弹窗在屏幕上的占位范围”。
+        pet_w = layout["pet_w"] * scale
+        pet_h = layout["pet_h"] * scale
+        photo = self._preview_pet_photo_px(pet_w, pet_h)
+        pet_y = y + max(0.0, (win_h - pet_h) / 2.0)
+        # 600 px 上限下也保证桌宠完整画在预览区内，不越界。
+        pet_y = max(0.0, min(max(0.0, height - pet_h), pet_y))
+        if photo is not None:
+            self._pet_preview_photo = photo
+            canvas.create_image(x + 12 * scale, pet_y, image=photo, anchor="nw")
+        else:
+            canvas.create_rectangle(x + 12 * scale, pet_y,
+                                    x + 12 * scale + pet_w, pet_y + pet_h,
+                                    fill="#cbd5e1", outline="#94a3b8")
+
+        bx = x + (12 + layout["pet_w"] + 16) * scale
+        bw = layout["bubble_w"] * scale
+        bh = layout["bubble_h"] * scale
+        by = y + max(10.0 * scale, (win_h - bh) / 2.0)
+        by = max(0.0, min(max(0.0, height - bh), by))
+        radius = max(1.0, 18 * scale)
+        canvas.create_rectangle(bx + 1, by + 2, bx + bw + 1, by + bh + 2,
+                                fill="#dce2ea", outline="")
+        rounded_rect(canvas, bx, by, bx + bw, by + bh, radius,
+                     fill="#ffffff", outline="#cfd8e3", width=1)
+
+        pad_x = max(1.0, 18 * scale)
+        text_w = max(1, int(bw - 2 * pad_x))
+        title_px = max(1, int(round(layout["title_font"].metrics("linespace") * scale)))
+        sub_px = max(1, int(round(layout["sub_font"].metrics("linespace") * scale)))
+        # 极小字号下 Windows 字体宽度不再严格线性，按实测逐级缩小，
+        # 避免文字比气泡还宽（真机里文字始终包在气泡内）。
+        title_px, title_font = self._fit_pixel_font(
+            title_px, True, layout["lines"], text_w)
+        sub_px, sub_font = self._fit_pixel_font(
+            sub_px, False, layout["sub_lines"], text_w)
+        canvas.create_text(
+            bx + pad_x, by + pad_x,
+            text="\n".join(layout["lines"]), anchor="nw", width=text_w,
+            font=title_font, fill="#1f2937",
+        )
+        canvas.create_text(
+            bx + pad_x, by + bh - pad_x,
+            text="\n".join(layout["sub_lines"]), anchor="sw", width=text_w,
+            font=sub_font, fill="#6b7280",
+        )
+
+        # 时钟：真机窗口右侧 58 px 的圆形闹钟。
+        clock_real = layout["clock_size"]
+        cx = x + (12 + layout["pet_w"] + 16 + layout["bubble_w"] + 14
+                  + clock_real / 2.0) * scale
+        cy = y + win_h / 2.0
+        radius = (clock_real / 2.0 - 4) * scale
+        if radius >= 1:
+            canvas.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                               fill="#f8fafc", outline="#94a3b8",
+                               width=1 if radius < 8 else 2)
+            if radius >= 5:
+                for number in range(12):
+                    angle = math.radians(number * 30 - 90)
+                    inner = radius * (0.7 if number % 3 == 0 else 0.82)
+                    canvas.create_line(cx + math.cos(angle) * inner,
+                                       cy + math.sin(angle) * inner,
+                                       cx + math.cos(angle) * (radius - 1),
+                                       cy + math.sin(angle) * (radius - 1),
+                                       fill="#94a3b8", width=1)
+            canvas.create_line(cx, cy, cx, cy - radius * 0.55,
+                               fill="#1f2937", width=1 if radius < 10 else 2)
+            canvas.create_line(cx, cy, cx + radius * 0.7, cy,
+                               fill="#1f2937", width=1 if radius < 10 else 2)
+
+        info = getattr(self, "pet_preview_info", None)
+        if info is not None:
+            bg_name = getattr(self, "_preview_bg_name", None)
+            suffix = (" · 背景 %s（完整显示）" % bg_name) if bg_name else " · 默认纯色背景"
+            info.config(
+                text=("模拟屏幕 %d × %d · 16:9 预览 · 缩放 %.0f%% · 桌宠 %d px%s"
+                      % (screen_w, screen_h, scale * 100, size, suffix)))
+
+    def _schedule_preview_redraw(self, _event=None):
+        """窗口尺寸变化时稍作合并再重绘，避免拖动边框时频繁重算。"""
+        if self._preview_redraw_job:
+            try:
+                self.root.after_cancel(self._preview_redraw_job)
+            except tk.TclError:
+                pass
+        self._preview_redraw_job = self.root.after(60, self._redraw_pet_preview)
+
+
+    def _on_pet_size_slide(self, value):
+        try:
+            size = self.set_pet_size(value, save=False)
+        except (TypeError, ValueError):
+            return
+        self.pet_size_label.config(text="%d px" % size)
+        self._redraw_pet_preview()
+        self._schedule_pet_save()
+
+    def _sync_pet_settings(self):
+        """config.json 载入（或重置）后，让滑块与效果图跟上真实数值。"""
+        size = self.pet_size()
+        try:
+            self.pet_size_var.set(size)
+            self.pet_size_label.config(text="%d px" % size)
+        except (tk.TclError, AttributeError):
+            pass
+        self._redraw_pet_preview()
+
+    def reset_pet_size(self):
+        if not messagebox.askyesno(
+                APP_TITLE, "确认重置大小吗？\n桌宠大小将恢复为出厂默认 %d px。"
+                % DEFAULT_SIZE, parent=self.root):
+            return
+        self.set_pet_size(DEFAULT_SIZE)
+        self._sync_pet_settings()
+        self._set_status("桌宠大小已重置为 %d px" % DEFAULT_SIZE)
+
+    def reset_pet_position(self):
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "确认重置位置吗？\n桌宠将回到屏幕右下角（距右侧/底部 %d px）。"
+                % DEFAULT_X, parent=self.root):
+            return
+        self.config["pet_x"] = DEFAULT_X
+        self.config["pet_y"] = DEFAULT_Y
+        self._save_config_now()
+        self._sync_pet_settings()
+        self._set_status("桌宠位置已重置到右下角")
+
+    def reset_pet_all(self):
+        if not messagebox.askyesno(
+                APP_TITLE, "确认一键重置吗？\n桌宠大小和位置都将恢复出厂默认。",
+                parent=self.root):
+            return
+        self.set_pet_size(DEFAULT_SIZE, save=False)
+        self.config["pet_x"] = DEFAULT_X
+        self.config["pet_y"] = DEFAULT_Y
+        self._save_config_now()
+        self._sync_pet_settings()
+        self._set_status("桌宠大小和位置已恢复出厂默认")
 
     # ------------------------------ 数据 ------------------------------
 
@@ -2261,6 +3116,7 @@ class CourseReminderApp:
         self.template_var.set(self.config["default_template"])
         self.extra_template_var.set(self.config["extra_template"])
         self.term_var.set(self.term_start.isoformat() if self.term_start else "")
+        self._sync_pet_settings()
 
         raw_makeup = load_json(MAKEUP_PATH, None)
         items = []
@@ -2898,20 +3754,43 @@ class CourseReminderApp:
             pass
         os._exit(0)
 
+    def _toggle_autostart(self):
+        """勾选/取消时同步写入或删除 HKCU Run 中的自启项。"""
+        want = bool(self.autostart_var.get())
+        if set_autostart(want):
+            self._set_status(
+                "已开启开机自启，登录后静默挂后台" if want else "已关闭开机自启")
+        else:
+            self.autostart_var.set(not want)
+            messagebox.showerror(APP_TITLE, "写入注册表失败，无法修改开机自启",
+                                 parent=self.root)
+
     def on_close(self):
         self.hide_to_background()
 
 
+SILENT_ARGS = ("--silent", "-s")
+
+
 def main():
     enable_dpi_awareness()
+    # 开机自启时由计划任务/快捷方式传入 --silent 或 -s，启动后直接隐身挂后台。
+    silent = any(arg in SILENT_ARGS for arg in sys.argv[1:])
     instance = SingleInstance()
     if instance.already_running:
-        # 已经有实例在后台：通知旧实例显示窗口，本进程立即退出。
-        instance.signal_existing()
+        # 已经有实例在运行：静默启动时不去打扰它，否则唤醒旧实例显示窗口。
+        if not silent:
+            instance.signal_existing()
         instance.close()
         return
     root = tk.Tk()
+    if silent:
+        # 关键：必须紧跟在 Tk() 之后立即 withdraw，
+        # 此时还没有任何布局、update 或 mainloop 渲染，窗口不会闪现。
+        root.withdraw()
     app = CourseReminderApp(root, instance)
+    if silent:
+        app.hide_to_background()
     try:
         root.mainloop()
     finally:
