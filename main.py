@@ -40,7 +40,7 @@ PET_MAX_SIZE = 600
 # 预览区背景图候选：同一目录下按此顺序查找，png 优先，其次 jpg / jpeg。
 PREVIEW_BG_NAMES = ("win11_bg.png", "win11_bg.jpg", "win11_bg.jpeg")
 DEFAULT_TEMPLATE = "到时间了，现在应该去上{课程名}课"
-DEFAULT_EXTRA_TEMPLATE = "还有 {minutes} 分钟就要去上 {课程名} 课了"
+DEFAULT_EXTRA_TEMPLATE = "还有 {leave_minutes} 分钟就要去上 {课程名} 课了"
 TRANSPARENT_KEY = "#010203"
 HOLIDAY_URL = "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/{year}.json"
 HOLIDAY_MIRROR = "https://fastly.jsdelivr.net/gh/NateScarlet/holiday-cn@master/{year}.json"
@@ -260,6 +260,18 @@ def detect_period_end(text):
     )
 
 
+def default_end_for_start(start):
+    """结束时间留空时：开始节次对应到下一节下课；无作息时顺延 45 分钟。"""
+    number = detect_period_start(start)
+    if number and PERIODS:
+        index = min(number, len(PERIODS) - 1)
+        return PERIODS[index][1]
+    total = time_to_minutes(start)
+    if total is None:
+        return None
+    return minutes_to_time(min(total + 45, 23 * 60 + 59))
+
+
 def valid_period(value):
     """接受 4 / "4" / "第4节"，返回有效节次，否则 None。"""
     if value is None:
@@ -288,6 +300,27 @@ def resolve_course_periods(course):
     if period_to < period_from:
         period_to = period_from
     return period_from, period_to
+
+
+def course_is_expired(course, today=None):
+    """课程结束日期早于今天时返回 True；没有结束日期视为不限期。"""
+    end_date = parse_date(course.get("end_date", ""))
+    if end_date is None:
+        return False
+    return end_date < (today or dt.date.today())
+
+
+def course_is_active_on(course, today=None):
+    """严格按纯日期判断：start <= today <= end，时间部分完全不参与。"""
+    day = today or dt.date.today()
+    start_date = parse_date(course.get("start_date", ""))
+    end_date = parse_date(course.get("end_date", ""))
+    if start_date is not None and start_date > day:
+        return False
+    if end_date is not None and end_date < day:
+        return False
+    return True
+
 
 
 def course_sort_key(course):
@@ -324,59 +357,41 @@ def wrap_text(text, font, max_width):
 
 
 def parse_date(text):
+    """接受 YYYY-M-D / YYYY-MM-DD，返回 date 或 None。"""
     if not isinstance(text, str):
         return None
     value = text.strip()
     if not value:
         return None
+    parts = value.split("-")
+    if len(parts) != 3:
+        return None
     try:
-        return dt.datetime.strptime(value, "%Y-%m-%d").date()
-    except ValueError:
+        year, month, day = (int(part) for part in parts)
+        return dt.date(year, month, day)
+    except (TypeError, ValueError):
         return None
 
 
-def parse_weeks(text):
-    """把 'all'、'1,2,3'、'1-16' 解析为 'all' 或整数列表。"""
-    if isinstance(text, list):
-        nums = sorted({int(item) for item in text})
-        return nums if nums else "all"
-    value = (text or "").strip().lower()
-    if not value or value == "all":
-        return "all"
-    result = set()
-    for piece in value.replace("，", ",").split(","):
-        piece = piece.strip()
-        if not piece:
-            continue
-        if "-" in piece:
-            left, right = piece.split("-", 1)
-            start, end = int(left), int(right)
-            if start > end:
-                start, end = end, start
-            result.update(range(start, end + 1))
-        else:
-            result.add(int(piece))
-    if not result:
-        return "all"
-    if min(result) < 1 or max(result) > 60:
-        raise ValueError("周次必须在 1-60 之间")
-    return sorted(result)
+def format_date(value):
+    """统一显示为不补零的 YYYY-M-D；解析失败返回空字符串。"""
+    if isinstance(value, str):
+        value = parse_date(value)
+    if not isinstance(value, dt.date):
+        return ""
+    return "%d-%d-%d" % (value.year, value.month, value.day)
 
 
-def weeks_to_text(weeks):
-    if weeks == "all" or not isinstance(weeks, list) or not weeks:
-        return "all"
-    nums = sorted({int(item) for item in weeks})
-    ranges = []
-    start = prev = nums[0]
-    for number in nums[1:]:
-        if number == prev + 1:
-            prev = number
-            continue
-        ranges.append((start, prev))
-        start = prev = number
-    ranges.append((start, prev))
-    return ",".join(str(a) if a == b else "%d-%d" % (a, b) for a, b in ranges)
+def course_date_text(course):
+    start = format_date(course.get("start_date"))
+    end = format_date(course.get("end_date"))
+    if start and end:
+        return "%s ~ %s" % (start, end)
+    if start:
+        return "%s 起" % start
+    if end:
+        return "至 %s" % end
+    return "未限制"
 
 
 def normalize_extra(raw):
@@ -402,17 +417,26 @@ def normalize_course(raw):
         end = parse_time(str(raw.get("end", "")))
     except (TypeError, ValueError):
         return None
-    if not name or start is None or end is None or not 1 <= weekday <= 7:
+    if not name or start is None or not 1 <= weekday <= 7:
         return None
+    # 结束时间留空时按开始节次补到下一节下课；这样旧数据、临时课程
+    # 和只填开始时间的快速录入都能得到完整的长条块。
+    if end is None:
+        end = default_end_for_start(start)
+    if end is None or end < start:
+        end = start
     try:
         advance = int(raw.get("advance", 0) or 0)
     except (TypeError, ValueError):
         advance = 0
     advance = max(0, min(advance, 720))
-    try:
-        weeks = parse_weeks(raw.get("weeks", "all"))
-    except (TypeError, ValueError):
-        weeks = "all"
+    start_date = parse_date(str(raw.get("start_date", "") or ""))
+    end_date = parse_date(str(raw.get("end_date", "") or ""))
+    # 结束日期留空默认只生效开始当天。
+    if start_date and not end_date:
+        end_date = start_date
+    if start_date and end_date and end_date < start_date:
+        end_date = start_date
 
     period_from = valid_period(raw.get("period_from"))
     period_to = valid_period(raw.get("period_to"))
@@ -449,7 +473,8 @@ def normalize_course(raw):
         "end": end,
         "place": str(raw.get("place", "")).strip(),
         "advance": advance,
-        "weeks": weeks,
+        "start_date": format_date(start_date),
+        "end_date": format_date(end_date),
         "text": str(raw.get("text", "")).strip(),
         "period_from": period_from,
         "period_to": period_to,
@@ -475,28 +500,38 @@ def normalize_makeup(raw):
     return {"date": date_text, "follow_weekday": follow}
 
 
-def render_text(template, course, minutes=None):
-    """替换 {课程名} {时间} {地点} 和额外提醒的 {minutes}，只替换一次。"""
+def render_text(template, course, class_minutes=None, leave_minutes=None):
+    """替换课程变量、{class_minutes} 和 {leave_minutes}。"""
     values = {
         "课程名": course.get("name", ""),
         "时间": course.get("start", ""),
         "地点": course.get("place", ""),
-        "minutes": "" if minutes is None else str(minutes),
+        "class_minutes": "" if class_minutes is None else str(class_minutes),
+        "leave_minutes": "" if leave_minutes is None else str(leave_minutes),
     }
     if not template:
         return ""
-    return re.sub(r"\{(课程名|时间|地点|minutes)\}", lambda m: values[m.group(1)], template)
+    return re.sub(
+        r"\{(课程名|时间|地点|class_minutes|leave_minutes)\}",
+        lambda m: values[m.group(1)], template)
 
 
 def build_course_reminders(course):
     """把基础提醒和额外提醒合并，按提前分钟数从大到小排序。
 
-    每个提醒保留 kind/index，用于独立去重。即使分钟数相同也互不覆盖。
+    每个提醒保留 kind/index，用于独立去重。class_minutes 是距正式上课的
+    分钟数；leave_minutes 是该提醒距“出门”的分钟数（额外提前量减基础提前量）。
     """
+    try:
+        base_advance = max(0, min(int(course.get("advance", 0)), 720))
+    except (TypeError, ValueError):
+        base_advance = 0
     reminders = [{
         "kind": "base",
         "index": 0,
-        "advance": int(course.get("advance", 0)),
+        "advance": base_advance,
+        "class_minutes": base_advance,
+        "leave_minutes": 0,
         "text": str(course.get("text", "") or ""),
     }]
     if course.get("extra_enabled"):
@@ -505,10 +540,13 @@ def build_course_reminders(course):
                 advance = int(extra.get("advance", 0))
             except (TypeError, ValueError):
                 continue
+            advance = max(0, min(advance, 720))
             reminders.append({
                 "kind": "extra",
                 "index": index,
-                "advance": max(0, min(advance, 720)),
+                "advance": advance,
+                "class_minutes": advance,
+                "leave_minutes": max(0, advance - base_advance),
                 "text": str(extra.get("text", "") or ""),
             })
     reminders.sort(key=lambda item: (
@@ -1441,6 +1479,23 @@ class TimetableWindow:
         self.win.geometry("%dx%d+%d+%d" % (self.win_w, self.win_h, x, y))
         self.win.minsize(900, 520)
 
+        # 顶部信息与左右切换开关固定在滚动区外面，滚动课表时不会移动。
+        self.show_all = False
+        self._font_cache = {}
+        self.info_var = tk.StringVar(value="")
+        topbar = tk.Frame(self.win, bg="#ffffff")
+        topbar.pack(fill="x")
+        tk.Label(
+            topbar, textvariable=self.info_var, bg="#ffffff", fg="#94a3b8",
+            font=("Microsoft YaHei UI", 8), anchor="w",
+        ).pack(side="left", padx=12, pady=(5, 2))
+        self.mode_toggle = tk.Canvas(
+            topbar, width=220, height=30, bg="#ffffff",
+            highlightthickness=0, bd=0, cursor="hand2",
+        )
+        self.mode_toggle.pack(side="right", padx=10, pady=(3, 2))
+        self.mode_toggle.bind("<Button-1>", self._toggle_mode)
+
         self.header = tk.Canvas(
             self.win, height=44, width=self.total_w, bg="#f3f4f6",
             highlightthickness=0, bd=0,
@@ -1468,6 +1523,82 @@ class TimetableWindow:
         delta = int(-1 * (event.delta / 120)) if event.delta else 0
         if delta:
             self.canvas.yview_scroll(delta, "units")
+
+    def _toggle_mode(self, _event=None):
+        self.show_all = not self.show_all
+        self._draw_toggle()
+        self._draw()
+
+    def _draw_toggle(self):
+        canvas = self.mode_toggle
+        canvas.delete("all")
+        width, height = 220, 30
+        active_color = "#1d4ed8"
+        inactive_color = "#94a3b8"
+        canvas.create_text(
+            42, height / 2, text="当前生效",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fill=active_color if not self.show_all else inactive_color)
+        canvas.create_text(
+            178, height / 2, text="全部课程",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            fill=active_color if self.show_all else inactive_color)
+
+        # iOS 风格开关：圆角蓝色底座 + 白色圆形滑块，点击整块切换。
+        track_left, track_right = 84, 136
+        track_top, track_bottom = 3, 27
+        canvas.create_oval(track_left, track_top, track_left + 24, track_bottom,
+                           fill="#2563eb", outline="")
+        canvas.create_rectangle(track_left + 12, track_top,
+                                track_right - 12, track_bottom,
+                                fill="#2563eb", outline="")
+        canvas.create_oval(track_right - 24, track_top, track_right, track_bottom,
+                           fill="#2563eb", outline="")
+        knob_x = 96 if not self.show_all else 124
+        canvas.create_oval(knob_x - 10, height / 2 - 10,
+                           knob_x + 10, height / 2 + 10,
+                           fill="#ffffff", outline="#dbeafe", width=1)
+
+    def _update_info(self):
+        start = format_date(getattr(self.app, "term_start", None)) or "未设置"
+        end = format_date(getattr(self.app, "term_end", None)) or "未设置"
+        self.info_var.set("学期：%s 至 %s" % (start, end))
+
+    def _visible_courses(self):
+        """左：今天在课程日期内；右：结束日期不早于今天。"""
+        today = dt.date.today()
+        visible = []
+        for course in self.courses:
+            if self.show_all:
+                end = parse_date(course.get("end_date", ""))
+                if end is not None and end < today:
+                    continue
+            elif not course_is_active_on(course, today):
+                continue
+            visible.append(course)
+        return visible
+
+    def _is_temporary(self, course):
+        global_start = format_date(getattr(self.app, "term_start", None))
+        global_end = format_date(getattr(self.app, "term_end", None))
+        return (course.get("start_date", "") != global_start
+                or course.get("end_date", "") != global_end)
+
+    @staticmethod
+    def _short_date(value):
+        parsed = parse_date(value) if value else None
+        return "%d.%d" % (parsed.month, parsed.day) if parsed else ""
+
+    def _course_date_label(self, course):
+        start = self._short_date(course.get("start_date", ""))
+        end = self._short_date(course.get("end_date", ""))
+        if start and end:
+            return start if start == end else "%s-%s" % (start, end)
+        if start:
+            return "%s 起" % start
+        if end:
+            return "至 %s" % end
+        return ""
 
     def _course_color(self, name):
         palette = ("#e8f1fb", "#eaf7ee", "#fff4e5", "#f3eafb",
@@ -1567,6 +1698,8 @@ class TimetableWindow:
         return from_index + 1, to_index + 1, y1, y2
 
     def _draw(self):
+        self._update_info()
+        self._draw_toggle()
         self.header.delete("all")
         self.canvas.delete("all")
 
@@ -1622,7 +1755,7 @@ class TimetableWindow:
             self.canvas.create_line(0, y, self.total_w, y, fill="#dbe2ea")
 
         by_day = {day: [] for day in range(1, 8)}
-        for course in self.courses:
+        for course in self._visible_courses():
             weekday = int(course.get("weekday", 0))
             if weekday not in by_day:
                 continue
@@ -1646,51 +1779,115 @@ class TimetableWindow:
                 "y2": y2,
             })
 
+        # 按“局部重叠簇”分配列：当天完全没有重叠的课程独占整行宽度，
+        # 只有相互重叠的那一组课程才分左右列，且每个方块仍是完整长条。
         for weekday, entries in by_day.items():
             if not entries:
                 continue
+            entries.sort(key=lambda item: (
+                item["from"], item["to"], item["course"]["name"]))
+            base_x = self.PERIOD_WIDTH + (weekday - 1) * self.day_w
             for cluster in self._interval_clusters(entries):
                 lane_count = self._assign_lanes(cluster)
                 lane_w = self.day_w / lane_count
-                base_x = self.PERIOD_WIDTH + (weekday - 1) * self.day_w
                 for entry in cluster:
                     course = entry["course"]
-                    x1 = base_x + entry["lane"] * lane_w + 3
-                    x2 = base_x + (entry["lane"] + 1) * lane_w - 3
-                    y1 = entry["y1"]
-                    y2 = entry["y2"]
-                    width = max(24, x2 - x1)
-                    height = max(24, y2 - y1)
-                    self.canvas.create_rectangle(
-                        x1, y1, x2, y2,
-                        fill=self._course_color(course["name"]),
-                        outline="#93a7bd", width=1,
-                    )
-                    text_w = width - 12
-                    name_id = self.canvas.create_text(
-                        x1 + 6, y1 + 6, text=course["name"], anchor="nw",
-                        width=text_w, font=("Microsoft YaHei UI", 9, "bold"),
-                        fill="#1e293b",
-                    )
-                    bbox = self.canvas.bbox(name_id)
-                    cursor_y = (bbox[3] + 2) if bbox else (y1 + 26)
-                    if cursor_y + 30 <= y2:
-                        time_id = self.canvas.create_text(
-                            x1 + 6, cursor_y,
-                            text="%s-%s" % (course["start"], course["end"]),
-                            anchor="nw", width=text_w,
-                            font=("Microsoft YaHei UI", 7), fill="#475569",
-                        )
-                        time_bbox = self.canvas.bbox(time_id)
-                        place_y = (time_bbox[3] + 1) if time_bbox else cursor_y + 14
-                        if place_y + 10 <= y2:
-                            self.canvas.create_text(
-                                x1 + 6, place_y,
-                                text=course.get("place", "") or "",
-                                anchor="nw", width=text_w,
-                                font=("Microsoft YaHei UI", 7), fill="#475569",
-                            )
+                    x1 = base_x + entry["lane"] * lane_w + 2
+                    x2 = base_x + (entry["lane"] + 1) * lane_w - 2
+                    self._draw_course_block(
+                        course, x1, entry["y1"], x2, entry["y2"])
         self.canvas.configure(scrollregion=(0, 0, self.total_w, self.total_h))
+
+    def _font_for(self, size, bold=False):
+        key = (int(size), bool(bold))
+        if key not in self._font_cache:
+            self._font_cache[key] = tkfont.Font(
+                family="Microsoft YaHei UI", size=int(size),
+                weight="bold" if bold else "normal")
+        return self._font_cache[key]
+
+    def _fit_line(self, text, font, max_width):
+        """把单行文字压缩到可用宽度；放不下时截断并补省略号。"""
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        if font.measure(text) <= max_width:
+            return text
+        ellipsis = "…"
+        if font.measure(ellipsis) > max_width:
+            return ""
+        while text and font.measure(text + ellipsis) > max_width:
+            text = text[:-1]
+        return (text + ellipsis) if text else ellipsis
+
+    def _draw_course_block(self, course, x1, y1, x2, y2):
+        """绘制一个课程方块，所有文字都严格裁剪在方块内部。"""
+        width = max(20, x2 - x1)
+        if y2 - y1 < 24:
+            y2 = y1 + 24
+        self.canvas.create_rectangle(
+            x1, y1, x2, y2,
+            fill=self._course_color(course["name"]),
+            outline="#93a7bd", width=1,
+        )
+        max_w = max(8, int(width) - 10)
+        max_bottom = y2 - 3
+        cursor = y1 + 4
+
+        # 课程名：优先缩小字号，仍放不下才截断加省略号。
+        name = str(course.get("name", "")).strip()
+        name_size = 6
+        name_label = ""
+        for size in (10, 9, 8, 7, 6):
+            font = self._font_for(size, True)
+            if font.measure(name) <= max_w:
+                name_size = size
+                name_label = name
+                break
+        if not name_label:
+            name_size = 6
+            name_label = self._fit_line(
+                name, self._font_for(name_size, True), max_w)
+        if name_label:
+            item = self.canvas.create_text(
+                x1 + 5, cursor, text=name_label, anchor="nw", width=0,
+                font=("Microsoft YaHei UI", name_size, "bold"),
+                fill="#1e293b")
+            bbox = self.canvas.bbox(item)
+            if bbox and bbox[3] <= max_bottom and bbox[2] <= x2 - 2:
+                cursor = bbox[3] + 2
+            else:
+                self.canvas.delete(item)
+
+        # 时间、地点、临时日期：逐行放入剩余高度；放不下就隐藏，
+        # 单行仍超宽则截断。绝不越出方块。
+        date_text = (self._course_date_label(course)
+                     if self._is_temporary(course) else "")
+        details = [
+            ("%s-%s" % (course.get("start", ""), course.get("end", "")),
+             7, "#475569"),
+            (course.get("place", "") or "", 7, "#475569"),
+            (date_text, 6, "#94a3b8"),
+        ]
+        for text, size, color in details:
+            if not text:
+                continue
+            font = self._font_for(size)
+            line_h = font.metrics("linespace")
+            if cursor + line_h > max_bottom:
+                break
+            label = self._fit_line(text, font, max_w)
+            if not label:
+                break
+            item = self.canvas.create_text(
+                x1 + 5, cursor, text=label, anchor="nw", width=0,
+                font=("Microsoft YaHei UI", size), fill=color)
+            bbox = self.canvas.bbox(item)
+            if (not bbox or bbox[3] > max_bottom
+                    or bbox[2] > x2 - 2):
+                self.canvas.delete(item)
+                break
+            cursor = bbox[3] + 1
 
     def refresh(self, courses, schedule=None):
         self.courses = courses
@@ -1712,7 +1909,7 @@ class TimetableWindow:
 # ---------------------------------------------------------------------------
 
 class CourseDialog(tk.Toplevel):
-    def __init__(self, parent, title, course=None):
+    def __init__(self, parent, title, course=None, term_start=None, term_end=None):
         super().__init__(parent)
         self.result = None
         self.title(title)
@@ -1723,6 +1920,8 @@ class CourseDialog(tk.Toplevel):
         self.columnconfigure(1, weight=1)
 
         course = course or {}
+        default_start = format_date(term_start)
+        default_end = format_date(term_end)
         self.name_var = tk.StringVar(value=course.get("name", ""))
         self.weekday_var = tk.StringVar(
             value=WEEKDAY_NAMES[int(course.get("weekday", 1)) - 1]
@@ -1731,7 +1930,10 @@ class CourseDialog(tk.Toplevel):
         self.end_var = tk.StringVar(value=course.get("end", "09:40"))
         self.place_var = tk.StringVar(value=course.get("place", ""))
         self.advance_var = tk.StringVar(value=str(course.get("advance", 10)))
-        self.weeks_var = tk.StringVar(value=weeks_to_text(course.get("weeks", "all")))
+        self.start_date_var = tk.StringVar(
+            value=format_date(course.get("start_date")) or default_start)
+        self.end_date_var = tk.StringVar(
+            value=format_date(course.get("end_date")) or default_end)
         self.extra_enabled_var = tk.BooleanVar(value=bool(course.get("extra_enabled", False)))
         self.evening_var = tk.BooleanVar(
             value=bool(course.get("is_evening_study", False)))
@@ -1767,7 +1969,7 @@ class CourseDialog(tk.Toplevel):
         ttk.Label(self, text="结束时间").grid(row=row, column=0, sticky="w", pady=4)
         self.end_entry = ttk.Entry(self, textvariable=self.end_var, width=9)
         self.end_entry.grid(row=row, column=1, sticky="w", pady=4)
-        ttk.Label(self, text="格式 HH:MM").grid(
+        ttk.Label(self, text="留空自动顺延两节").grid(
             row=row, column=2, columnspan=2, sticky="w", padx=(18, 0))
 
         row += 1
@@ -1846,10 +2048,16 @@ class CourseDialog(tk.Toplevel):
             self._rebuild_extra_rows([])
 
         row += 1
-        ttk.Label(self, text="生效周次").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Entry(self, textvariable=self.weeks_var, width=40).grid(
-            row=row, column=1, columnspan=3, sticky="we", pady=4)
-        ttk.Label(self, text="all 或 1,2,3 或 1-16；未设置学期开始日期时忽略",
+        ttk.Label(self, text="生效日期").grid(row=row, column=0, sticky="w", pady=4)
+        date_frame = ttk.Frame(self)
+        date_frame.grid(row=row, column=1, columnspan=3, sticky="w", pady=4)
+        ttk.Label(date_frame, text="从").pack(side="left")
+        ttk.Entry(date_frame, textvariable=self.start_date_var, width=12).pack(
+            side="left", padx=(4, 10))
+        ttk.Label(date_frame, text="到").pack(side="left")
+        ttk.Entry(date_frame, textvariable=self.end_date_var, width=12).pack(
+            side="left", padx=(4, 0))
+        ttk.Label(self, text="格式 YYYY-M-D；留空表示不限制，可临时修改",
                   style="Hint.TLabel").grid(row=row + 1, column=1, columnspan=3,
                                             sticky="w")
         row += 2
@@ -1867,7 +2075,7 @@ class CourseDialog(tk.Toplevel):
         self.text_box.configure(yscrollcommand=scroll.set)
 
         row += 1
-        ttk.Label(self, text="支持 {课程名} {时间} {地点}；留空则使用全局默认模板",
+        ttk.Label(self, text="支持 {课程名} {时间} {地点} {class_minutes} {leave_minutes}；留空则使用全局默认模板",
                   style="Hint.TLabel").grid(row=row, column=1, columnspan=3, sticky="w")
 
         row += 1
@@ -1982,14 +2190,15 @@ class CourseDialog(tk.Toplevel):
             messagebox.showerror(APP_TITLE, "请填写课程名", parent=self)
             return
         start = parse_time(self.start_var.get())
-        end = parse_time(self.end_var.get())
+        end_text = self.end_var.get().strip()
+        end = parse_time(end_text) if end_text else None
         if start is None:
             messagebox.showerror(APP_TITLE, "开始时间格式应为 HH:MM，例如 08:00", parent=self)
             return
-        if end is None:
-            messagebox.showerror(APP_TITLE, "结束时间格式应为 HH:MM，例如 09:40", parent=self)
+        if end_text and end is None:
+            messagebox.showerror(APP_TITLE, "结束时间格式应为 HH:MM，例如 09:40；留空可自动顺延", parent=self)
             return
-        if end < start:
+        if end is not None and end < start:
             messagebox.showerror(APP_TITLE, "结束时间不能早于开始时间", parent=self)
             return
         try:
@@ -2000,10 +2209,21 @@ class CourseDialog(tk.Toplevel):
         if not 0 <= advance <= 720:
             messagebox.showerror(APP_TITLE, "提前提醒分钟数应在 0-720 之间", parent=self)
             return
-        try:
-            weeks = parse_weeks(self.weeks_var.get())
-        except (TypeError, ValueError):
-            messagebox.showerror(APP_TITLE, "生效周次格式应为 all、1,2,3 或 1-16", parent=self)
+        start_date_text = self.start_date_var.get().strip()
+        end_date_text = self.end_date_var.get().strip()
+        start_date = parse_date(start_date_text) if start_date_text else None
+        end_date = parse_date(end_date_text) if end_date_text else None
+        if start_date_text and start_date is None:
+            messagebox.showerror(APP_TITLE, "课程生效开始日期格式应为 YYYY-M-D",
+                                 parent=self)
+            return
+        if end_date_text and end_date is None:
+            messagebox.showerror(APP_TITLE, "课程生效结束日期格式应为 YYYY-M-D",
+                                 parent=self)
+            return
+        if start_date and end_date and end_date < start_date:
+            messagebox.showerror(APP_TITLE, "课程生效结束日期不能早于开始日期",
+                                 parent=self)
             return
         weekday = WEEKDAY_NAMES.index(self.weekday_var.get()) + 1
 
@@ -2041,10 +2261,11 @@ class CourseDialog(tk.Toplevel):
             "name": name,
             "weekday": weekday,
             "start": start,
-            "end": end,
+            "end": end or "",
             "place": self.place_var.get().strip(),
             "advance": advance,
-            "weeks": weeks,
+            "start_date": format_date(start_date),
+            "end_date": format_date(end_date),
             "text": self.text_box.get("1.0", "end-1c").strip(),
             "period_from": period_from,
             "period_to": period_to,
@@ -2138,6 +2359,7 @@ class CourseReminderApp:
         self.courses = []
         self.schedule = []
         self.term_start = None
+        self.term_end = None
         self.config = {"default_template": DEFAULT_TEMPLATE,
                        "extra_template": DEFAULT_EXTRA_TEMPLATE}
         self.timetable_window = None
@@ -2168,6 +2390,10 @@ class CourseReminderApp:
         self._preview_bg_draw_rect = None
         self._clock_job = None
         self._clock_family = None
+        self._course_tree_fonts = None
+        self._column_width_job = None
+        self._widths_before_drag = None
+        self._applying_column_widths = False
 
         self.root.title(APP_TITLE)
         self.root.geometry("1040x850")
@@ -2177,7 +2403,6 @@ class CourseReminderApp:
         self._load_all()
         self._refresh_courses()
         self._refresh_makeup()
-        self._update_week_label()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind_all("<Escape>", self._close_all_reminders, add="+")
 
@@ -2218,7 +2443,7 @@ class CourseReminderApp:
         style.configure("Title.TLabel", font=("Microsoft YaHei UI", 18, "bold"))
         style.configure("Hint.TLabel", foreground="#6b7280")
         style.configure("Status.TLabel", foreground="#374151")
-        style.configure("Treeview", rowheight=26, font=("Microsoft YaHei UI", 9))
+        style.configure("Treeview", rowheight=30, font=("Microsoft YaHei UI", 9))
         style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
 
     def _build_ui(self):
@@ -2247,6 +2472,17 @@ class CourseReminderApp:
         self.notebook = notebook
         self.pet_tab = pet_tab
 
+        reminder_bar = ttk.Frame(body)
+        reminder_bar.pack(side="bottom", fill="x", pady=(2, 0))
+        self.start_button = ttk.Button(reminder_bar, text="启动提醒",
+                                       command=self.start_reminders)
+        self.start_button.pack(side="left")
+        self.stop_button = ttk.Button(reminder_bar, text="停止提醒",
+                                      command=self.stop_reminders, state="disabled")
+        self.stop_button.pack(side="left", padx=(8, 0))
+        ttk.Label(reminder_bar, text="关闭窗口不会停止提醒",
+                  style="Hint.TLabel").pack(side="right")
+
         courses_frame = ttk.LabelFrame(body, text="课程表", padding=8)
         courses_frame.pack(fill="both", expand=True, pady=(10, 8))
         toolbar = ttk.Frame(courses_frame)
@@ -2260,33 +2496,45 @@ class CourseReminderApp:
             side="left", padx=(8, 0))
         ttk.Button(toolbar, text="设置每日作息", command=self.open_schedule_dialog).pack(
             side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="恢复自适应列宽",
+                   command=self.reset_course_column_widths).pack(
+            side="left", padx=(8, 0))
         self.count_label = ttk.Label(toolbar, text="", style="Hint.TLabel")
         self.count_label.pack(side="right")
 
         tree_frame = ttk.Frame(courses_frame)
         tree_frame.pack(fill="both", expand=True)
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
         columns = (
-            ("name", "课程名", 160, "w"),
+            ("name", "课程名", 160, "center"),
             ("weekday", "星期", 62, "center"),
             ("start", "开始", 72, "center"),
             ("end", "结束", 72, "center"),
-            ("place", "地点", 130, "w"),
-            ("advance", "提前(分)", 74, "center"),
-            ("weeks", "周次", 86, "center"),
-            ("text", "自定义提醒", 220, "w"),
+            ("place", "地点", 130, "center"),
+            ("advance", "提前(分)", 66, "center"),
+            ("date_range", "起止日期", 150, "center"),
+            ("text", "自定义提醒", 200, "w"),
         )
+        self._course_columns = columns
         self.tree = ttk.Treeview(
             tree_frame, columns=[item[0] for item in columns],
-            show="headings", selectmode="browse", height=8,
+            show="headings", selectmode="browse", height=7,
         )
         for key, label, width, anchor in columns:
-            self.tree.heading(key, text=label)
+            self.tree.heading(key, text=label, anchor="center")
             self.tree.column(key, width=width, anchor=anchor,
-                             stretch=key in ("name", "place", "text"))
+                             minwidth=40, stretch=False)
+        self.tree.bind("<ButtonPress-1>", self._on_column_press, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._remember_column_widths, add="+")
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        self.course_hscroll = ttk.Scrollbar(
+            tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar.set,
+                            xscrollcommand=self.course_hscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.course_hscroll.grid(row=1, column=0, sticky="ew")
         self.tree.bind("<Double-1>", lambda _event: self.edit_course())
         # 鼠标放在课程列表上即可用滚轮上下滑动，不必去拖右侧滚动条。
         self.tree.bind("<MouseWheel>", self._on_course_wheel)
@@ -2297,15 +2545,22 @@ class CourseReminderApp:
         settings.pack(fill="x", pady=(0, 8))
         settings.columnconfigure(1, weight=1)
 
-        ttk.Label(settings, text="学期开始日期").grid(row=0, column=0, sticky="w")
+        ttk.Label(settings, text="学期日期").grid(row=0, column=0, sticky="w")
         self.term_var = tk.StringVar()
-        ttk.Entry(settings, textvariable=self.term_var, width=14).grid(
-            row=0, column=1, sticky="w", padx=(10, 6), pady=3)
-        ttk.Button(settings, text="保存", command=self.save_term_start).grid(
-            row=0, column=2, sticky="w", pady=3)
-        self.week_var = tk.StringVar()
-        ttk.Label(settings, textvariable=self.week_var, style="Hint.TLabel").grid(
-            row=0, column=3, sticky="w", padx=(14, 0))
+        self.term_end_var = tk.StringVar()
+        term_frame = ttk.Frame(settings)
+        term_frame.grid(row=0, column=1, columnspan=3, sticky="we",
+                        padx=(10, 6), pady=3)
+        ttk.Label(term_frame, text="开始").pack(side="left")
+        ttk.Entry(term_frame, textvariable=self.term_var, width=12).pack(
+            side="left", padx=(4, 10))
+        ttk.Label(term_frame, text="结束").pack(side="left")
+        ttk.Entry(term_frame, textvariable=self.term_end_var, width=12).pack(
+            side="left", padx=(4, 10))
+        ttk.Button(term_frame, text="保存", command=self.save_term_dates).pack(
+            side="left")
+        ttk.Label(term_frame, text="格式 YYYY-M-D", style="Hint.TLabel").pack(
+            side="left", padx=(12, 0))
 
         ttk.Label(settings, text="默认提醒模板").grid(row=1, column=0, sticky="w")
         self.template_var = tk.StringVar()
@@ -2313,7 +2568,7 @@ class CourseReminderApp:
             row=1, column=1, columnspan=2, sticky="we", padx=(10, 6), pady=3)
         ttk.Button(settings, text="保存", command=self.save_template).grid(
             row=1, column=3, sticky="e", pady=3)
-        ttk.Label(settings, text="支持 {课程名} {时间} {地点}；课程自定义提醒优先",
+        ttk.Label(settings, text="支持 {课程名} {时间} {地点} {class_minutes}；课程自定义提醒优先",
                   style="Hint.TLabel").grid(row=2, column=1, columnspan=3,
                                             sticky="w", padx=(10, 0))
 
@@ -2323,7 +2578,7 @@ class CourseReminderApp:
             row=3, column=1, columnspan=2, sticky="we", padx=(10, 6), pady=3)
         ttk.Button(settings, text="保存", command=self.save_extra_template).grid(
             row=3, column=3, sticky="e", pady=3)
-        ttk.Label(settings, text="支持 {minutes} {课程名}；额外提醒自定义文字优先",
+        ttk.Label(settings, text="支持 {leave_minutes} {class_minutes} {课程名}；额外提醒自定义文字优先",
                   style="Hint.TLabel").grid(row=4, column=1, columnspan=3,
                                             sticky="w", padx=(10, 0))
 
@@ -2359,17 +2614,6 @@ class CourseReminderApp:
         self.makeup_tree.column("date", width=180, anchor="center", stretch=False)
         self.makeup_tree.column("follow", width=180, anchor="center", stretch=False)
         self.makeup_tree.pack(fill="x")
-
-        reminder_bar = ttk.Frame(body)
-        reminder_bar.pack(fill="x", pady=(2, 0))
-        self.start_button = ttk.Button(reminder_bar, text="启动提醒",
-                                       command=self.start_reminders)
-        self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(reminder_bar, text="停止提醒",
-                                      command=self.stop_reminders, state="disabled")
-        self.stop_button.pack(side="left", padx=(8, 0))
-        ttk.Label(reminder_bar, text="关闭窗口不会停止提醒",
-                  style="Hint.TLabel").pack(side="right")
 
         self._build_pet_tab(pet_tab)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -3084,15 +3328,32 @@ class CourseReminderApp:
         raw_courses = load_json(COURSES_PATH, None)
         if isinstance(raw_courses, list):
             self.term_start = None
+            self.term_end = None
             raw_list = raw_courses
         elif isinstance(raw_courses, dict):
             self.term_start = parse_date(str(raw_courses.get("term_start", "")))
+            self.term_end = parse_date(str(raw_courses.get("term_end", "")))
             raw_list = raw_courses.get("courses", [])
         else:
             self.term_start = None
+            self.term_end = None
             raw_list = []
-        self.courses = sort_courses(
-            [c for c in (normalize_course(item) for item in raw_list) if c])
+        courses = []
+        today = dt.date.today()
+        for item in raw_list:
+            course = normalize_course(item)
+            if course is None:
+                continue
+            # 旧数据没有课程日期时，用学期日期作为默认值；留空则视为不限制。
+            if not course.get("start_date"):
+                course["start_date"] = format_date(self.term_start)
+            if not course.get("end_date"):
+                course["end_date"] = format_date(self.term_end)
+            # 结束日期已过的课程在启动时静默清掉；没有结束日期的课程保留。
+            if course_is_expired(course, today):
+                continue
+            courses.append(course)
+        self.courses = sort_courses(courses)
         try:
             self._save_courses()
         except Exception:
@@ -3104,7 +3365,10 @@ class CourseReminderApp:
             template = str(config.get("default_template", "")).strip()
             extra_template = str(config.get("extra_template", "")).strip()
             config["default_template"] = template or DEFAULT_TEMPLATE
-            config["extra_template"] = extra_template or DEFAULT_EXTRA_TEMPLATE
+            extra_template = extra_template or DEFAULT_EXTRA_TEMPLATE
+            # 旧版本保存过 {minutes}，升级后按额外提醒的 {leave_minutes} 处理。
+            extra_template = extra_template.replace("{minutes}", "{leave_minutes}")
+            config["extra_template"] = extra_template
             self.config = config
         else:
             self.config = {"default_template": DEFAULT_TEMPLATE,
@@ -3115,7 +3379,8 @@ class CourseReminderApp:
             pass
         self.template_var.set(self.config["default_template"])
         self.extra_template_var.set(self.config["extra_template"])
-        self.term_var.set(self.term_start.isoformat() if self.term_start else "")
+        self.term_var.set(format_date(self.term_start))
+        self.term_end_var.set(format_date(self.term_end))
         self._sync_pet_settings()
 
         raw_makeup = load_json(MAKEUP_PATH, None)
@@ -3149,13 +3414,31 @@ class CourseReminderApp:
         try:
             self.courses = sort_courses(self.courses)
             save_json(COURSES_PATH, {
-                "term_start": self.term_start.isoformat() if self.term_start else "",
+                "term_start": format_date(self.term_start),
+                "term_end": format_date(self.term_end),
                 "courses": self.courses,
             })
             return True
         except OSError as exc:
             messagebox.showerror(APP_TITLE, "保存 courses.json 失败：%s" % exc)
             return False
+
+    def _course_row_values(self, course):
+        text = course.get("text", "").replace("\n", " ")
+        if course.get("extra_enabled"):
+            extra_note = " +%d次额外" % len(course.get("extras", []))
+        else:
+            extra_note = ""
+        return (
+            course["name"],
+            WEEKDAY_NAMES[course["weekday"] - 1],
+            course["start"],
+            course["end"],
+            course.get("place", ""),
+            course.get("advance", 0),
+            course_date_text(course),
+            text + extra_note,
+        )
 
     def _refresh_courses(self):
         if self.hidden:
@@ -3164,22 +3447,13 @@ class CourseReminderApp:
         for item in self.tree.get_children():
             self.tree.delete(item)
         for index, course in enumerate(self.courses):
-            text = course.get("text", "").replace("\n", " ")
-            if course.get("extra_enabled"):
-                extra_note = " +%d次额外" % len(course.get("extras", []))
-            else:
-                extra_note = ""
-            self.tree.insert("", "end", iid=str(index), values=(
-                course["name"],
-                WEEKDAY_NAMES[course["weekday"] - 1],
-                course["start"],
-                course["end"],
-                course.get("place", ""),
-                course.get("advance", 0),
-                weeks_to_text(course.get("weeks", "all")),
-                text + extra_note,
-            ))
+            self.tree.insert("", "end", iid=str(index),
+                             values=self._course_row_values(course))
+        self._apply_course_column_widths()
         self.count_label.configure(text="共 %d 门课程" % len(self.courses))
+        # 刷新后始终回到最左侧，优先显示课程名与星期。
+        self.tree.xview_moveto(0)
+        self.tree.yview_moveto(0)
         if self.timetable_window is not None:
             try:
                 if self.timetable_window.win.winfo_exists():
@@ -3188,6 +3462,109 @@ class CourseReminderApp:
                     self.timetable_window = None
             except tk.TclError:
                 self.timetable_window = None
+
+    def _get_course_tree_fonts(self):
+        if self._course_tree_fonts is None:
+            style = ttk.Style(self.root)
+            cell_spec = style.lookup("Treeview", "font") or (
+                "Microsoft YaHei UI", 9)
+            head_spec = style.lookup("Treeview.Heading", "font") or (
+                "Microsoft YaHei UI", 9, "bold")
+            cell_font = tkfont.Font(root=self.root, font=cell_spec)
+            head_font = tkfont.Font(root=self.root, font=head_spec)
+            self._course_tree_fonts = (cell_font, head_font)
+        return self._course_tree_fonts
+
+    def _measure_course_column_widths(self):
+        """按表头和当前所有单元格的最长像素宽度 + 30px 计算列宽。"""
+        cell_font, head_font = self._get_course_tree_fonts()
+        labels = {key: label for key, label, _width, _anchor
+                  in self._course_columns}
+        widths = {}
+        for key, label, _width, _anchor in self._course_columns:
+            widest = head_font.measure(label)
+            for course in self.courses:
+                value = self._course_row_values(course)[
+                    [item[0] for item in self._course_columns].index(key)]
+                widest = max(widest, cell_font.measure(str(value)))
+            widths[key] = max(50, widest + 30)
+        return widths
+
+    def _saved_course_column_widths(self):
+        raw = self.config.get("course_column_widths")
+        if not isinstance(raw, dict):
+            return None
+        widths = {}
+        for key, _label, _width, _anchor in self._course_columns:
+            try:
+                value = int(raw[key])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if value < 40:
+                return None
+            widths[key] = value
+        return widths
+
+    def _apply_course_column_widths(self, force_adaptive=False):
+        widths = None if force_adaptive else self._saved_course_column_widths()
+        if not widths:
+            widths = self._measure_course_column_widths()
+        self._applying_column_widths = True
+        try:
+            for key, _label, _width, _anchor in self._course_columns:
+                self.tree.column(key, width=widths[key])
+        finally:
+            self._applying_column_widths = False
+        return widths
+
+    def _course_width_snapshot(self):
+        return {key: int(self.tree.column(key, "width"))
+                for key, _label, _width, _anchor in self._course_columns}
+
+    def _on_column_press(self, _event=None):
+        if self._applying_column_widths:
+            return
+        self._widths_before_drag = self._course_width_snapshot()
+
+    def _remember_column_widths(self, event=None):
+        if self._applying_column_widths:
+            return
+        before = self._widths_before_drag
+        self._widths_before_drag = None
+        if before is None or self._course_width_snapshot() == before:
+            return
+        if self._column_width_job:
+            try:
+                self.root.after_cancel(self._column_width_job)
+            except tk.TclError:
+                pass
+        self._column_width_job = self.root.after(80, self._persist_column_widths)
+
+    def _persist_column_widths(self):
+        self._column_width_job = None
+        self._widths_before_drag = None
+        if self._applying_column_widths:
+            return
+        widths = {}
+        for key, _label, _width, _anchor in self._course_columns:
+            widths[key] = int(self.tree.column(key, "width"))
+        if widths != self.config.get("course_column_widths"):
+            self.config["course_column_widths"] = widths
+            self._save_config_now()
+
+    def reset_course_column_widths(self):
+        """清除列宽记忆，按当前课程内容重新自适应一次。"""
+        if self._column_width_job:
+            try:
+                self.root.after_cancel(self._column_width_job)
+            except tk.TclError:
+                pass
+            self._column_width_job = None
+        self.config.pop("course_column_widths", None)
+        self._save_config_now()
+        self._apply_course_column_widths(force_adaptive=True)
+        self.tree.xview_moveto(0)
+        self._set_status("已恢复自适应列宽")
 
     def _refresh_makeup(self):
         if self.hidden:
@@ -3257,7 +3634,8 @@ class CourseReminderApp:
     # ------------------------------ 课程操作 ------------------------------
 
     def add_course(self):
-        dialog = CourseDialog(self.root, "添加课程")
+        dialog = CourseDialog(self.root, "添加课程",
+                              term_start=self.term_start, term_end=self.term_end)
         self.root.wait_window(dialog)
         if not dialog.result:
             return
@@ -3277,7 +3655,8 @@ class CourseReminderApp:
             messagebox.showinfo(APP_TITLE, "请先在列表中选择一门课程", parent=self.root)
             return
         old_course = self.courses[index]
-        dialog = CourseDialog(self.root, "编辑课程", old_course)
+        dialog = CourseDialog(self.root, "编辑课程", old_course,
+                              term_start=self.term_start, term_end=self.term_end)
         self.root.wait_window(dialog)
         if not dialog.result:
             return
@@ -3310,41 +3689,29 @@ class CourseReminderApp:
 
     # ------------------------------ 设置 ------------------------------
 
-    def save_term_start(self):
-        text = self.term_var.get().strip()
-        if text:
-            parsed = parse_date(text)
-            if parsed is None:
-                messagebox.showerror(APP_TITLE, "学期开始日期格式应为 YYYY-MM-DD",
-                                     parent=self.root)
-                return
-        else:
-            parsed = None
-        self.term_start = parsed
+    def save_term_dates(self):
+        start_text = self.term_var.get().strip()
+        end_text = self.term_end_var.get().strip()
+        start = parse_date(start_text) if start_text else None
+        end = parse_date(end_text) if end_text else None
+        if start_text and start is None:
+            messagebox.showerror(APP_TITLE, "学期开始日期格式应为 YYYY-M-D",
+                                 parent=self.root)
+            return
+        if end_text and end is None:
+            messagebox.showerror(APP_TITLE, "学期结束日期格式应为 YYYY-M-D",
+                                 parent=self.root)
+            return
+        if start and end and end < start:
+            messagebox.showerror(APP_TITLE, "学期结束日期不能早于开始日期",
+                                 parent=self.root)
+            return
+        self.term_start = start
+        self.term_end = end
         if self._save_courses():
-            self.term_var.set(parsed.isoformat() if parsed else "")
-            self._update_week_label()
-            self._set_status("学期开始日期已保存")
-
-    def _update_week_label(self):
-        if self.hidden:
-            return
-        if not self.term_start:
-            self.week_var.set("未设置学期开始日期，生效周次将被忽略")
-            return
-        week = self.current_week(dt.date.today())
-        if week is None or week <= 0:
-            self.week_var.set("当前教学周：尚未开学（开学 %s）" % self.term_start.isoformat())
-        else:
-            self.week_var.set("当前教学周：第 %d 周" % week)
-
-    def current_week(self, day):
-        if not self.term_start:
-            return None
-        delta = (day - self.term_start).days
-        if delta < 0:
-            return 0
-        return delta // 7 + 1
+            self.term_var.set(format_date(start))
+            self.term_end_var.set(format_date(end))
+            self._set_status("学期日期已保存")
 
     def save_template(self):
         template = self.template_var.get().strip()
@@ -3473,13 +3840,14 @@ class CourseReminderApp:
             return None, ""
         return day.isoweekday(), ""
 
-    def _course_active(self, course, week):
-        if week is None:
-            return True
-        weeks = course.get("weeks", "all")
-        if weeks == "all" or not isinstance(weeks, list):
-            return True
-        return week in weeks
+    def _course_in_date_range(self, course, today):
+        start = parse_date(course.get("start_date", ""))
+        end = parse_date(course.get("end_date", ""))
+        if start is not None and today < start:
+            return False
+        if end is not None and today > end:
+            return False
+        return True
 
     # ------------------------------ 提醒 ------------------------------
 
@@ -3567,10 +3935,6 @@ class CourseReminderApp:
     def _check_due(self):
         now = dt.datetime.now()
         today = now.date()
-        if self.last_week_day != today:
-            self.last_week_day = today
-            self._update_week_label()
-
         weekday, note = self._holiday_status(today)
         if note:
             key = (today.isoformat(), note)
@@ -3580,12 +3944,11 @@ class CourseReminderApp:
         if weekday is None:
             return
 
-        week = self.current_week(today)
         due = []
         for course in self.courses:
-            if course["weekday"] != weekday:
+            if not self._course_in_date_range(course, today):
                 continue
-            if not self._course_active(course, week):
+            if course["weekday"] != weekday:
                 continue
             try:
                 hour, minute = [int(part) for part in course["start"].split(":")]
@@ -3618,18 +3981,22 @@ class CourseReminderApp:
             return
         reminder = reminder or {
             "kind": "base", "index": 0, "advance": course.get("advance", 0),
+            "class_minutes": course.get("advance", 0), "leave_minutes": 0,
             "text": course.get("text", ""),
         }
         custom = (reminder.get("text") or "").strip()
         kind = reminder.get("kind", "base")
+        advance = int(reminder.get("advance", 0))
+        class_minutes = int(reminder.get("class_minutes", advance))
+        leave_minutes = int(reminder.get("leave_minutes", 0))
         if kind == "extra":
             template = custom or (self.config.get("extra_template") or
                                   DEFAULT_EXTRA_TEMPLATE)
-            text = render_text(template, course, reminder["advance"])
+            text = render_text(template, course, class_minutes, leave_minutes)
         else:
             template = custom or (self.config.get("default_template") or
                                   DEFAULT_TEMPLATE)
-            text = render_text(template, course)
+            text = render_text(template, course, class_minutes, 0)
 
         # 基础提醒是正式提醒：立即结束所有尚未关闭的额外提醒窗口。
         if kind == "base":
@@ -3699,7 +4066,6 @@ class CourseReminderApp:
         if was_hidden:
             self._refresh_courses()
             self._refresh_makeup()
-            self._update_week_label()
             self._pending_status = None
             self._set_status("已从后台回到前台，提醒继续运行")
 
